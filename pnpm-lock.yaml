@@ -69,6 +69,9 @@ catalogs:
     '@vitest/runner':
       specifier: ^4.1.7
       version: 4.1.7
+    '@vitest/spy':
+      specifier: ^4.1.6
+      version: 4.1.7
     '@vitest/ui':
       specifier: ^4.1.7
       version: 4.1.7
@@ -905,12 +908,18 @@ importers:
       '@typescript-eslint/parser':
         specifier: ^8.28.0
         version: 8.70.0(eslint@9.39.4(jiti@2.7.0))(typescript@7.0.2)
+      '@vitest/spy':
+        specifier: 'catalog:'
+        version: 4.1.7
       eslint-plugin-simple-import-sort:
         specifier: ^12.1.1
         version: 12.1.1(eslint@9.39.4(jiti@2.7.0))
       tsdown:
         specifier: 'catalog:'
         version: 0.23.0(oxc-resolver@11.19.1(@emnapi/core@1.11.0)(@emnapi/runtime@1.11.0))(tsx@4.22.3)(typescript@7.0.2)(unrun@0.2.32(@emnapi/core@1.11.0)(@emnapi/runtime@1.11.0))
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.7(@types/node@22.19.19)(@vitest/browser-playwright@4.1.7)(@vitest/ui@4.1.7)(msw@2.12.13(@types/node@22.19.19)(typescript@7.0.2))(vite@8.0.14(@types/node@22.19.19)(esbuild@0.28.0)(jiti@2.7.0)(terser@5.44.1)(tsx@4.22.3)(yaml@2.9.0))
 
   packages/preact:
     dependencies:
