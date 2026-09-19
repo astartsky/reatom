@@ -73,7 +73,7 @@ test('honors Retry-After header over computed backoff', async () => {
   expect(calls[0]).toBe(7000)
 })
 
-test('clamps Retry-After to maxDelayMs', async () => {
+test('does not shorten Retry-After to the local backoff cap', async () => {
   const send = vi
     .fn()
     .mockResolvedValueOnce(
@@ -86,7 +86,42 @@ test('clamps Retry-After to maxDelayMs', async () => {
     sleep,
     maxDelayMs: 5000,
   })
-  expect(calls[0]).toBe(5000)
+  expect(calls[0]).toBe(3_600_000)
+})
+
+test('settles a discarded response body before retrying', async () => {
+  const events: string[] = []
+  let finish!: () => void
+  const cleanup = new Promise<void>((resolve) => {
+    finish = resolve
+  })
+  const body = new ReadableStream({
+    cancel: async () => {
+      events.push('cancel-start')
+      await cleanup
+      events.push('cancel-settled')
+    },
+  })
+  const send = vi
+    .fn()
+    .mockResolvedValueOnce(new Response(body, { status: 503 }))
+    .mockImplementationOnce(async () => {
+      events.push('next-fetch')
+      return OK()
+    })
+  const { sleep } = makeSleep()
+  const result = retryWithBackoff({ send, sleep })
+  await Promise.resolve()
+  await Promise.resolve()
+  try {
+    expect(events).toEqual(['cancel-start'])
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  } finally {
+    finish()
+    await result
+  }
+  expect(events).toEqual(['cancel-start', 'cancel-settled', 'next-fetch'])
 })
 
 test('retries on TypeError thrown by fetch (network failure)', async () => {

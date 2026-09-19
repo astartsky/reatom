@@ -10,7 +10,7 @@ import { expect, test, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-import { createWithOTel } from './withOTel.ts'
+import { createTestWithOTel } from './test-helpers.ts'
 
 const targets = {
   action: (body: () => unknown, name: string) => action(body, name),
@@ -61,7 +61,7 @@ for (const [kind, make] of Object.entries(targets)) {
     revoke()
     const raw = make(() => proxy, 'raw')
     const traced = make(() => proxy, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan() {} })(),
+      createTestWithOTel({ isActive: () => true, queueSpan() {} })(),
     )
     context.start(() => {
       expect(raw() === proxy).toBe(true)
@@ -81,7 +81,7 @@ for (const [kind, make] of Object.entries(targets)) {
       calls++
       throw original
     }, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan() {} })(),
+      createTestWithOTel({ isActive: () => true, queueSpan() {} })(),
     )
     context.start(() => {
       let caught: unknown
@@ -105,7 +105,7 @@ for (const [kind, make] of Object.entries(targets)) {
       calls++
       return result
     }, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan: sink })(),
+      createTestWithOTel({ isActive: () => true, queueSpan: sink })(),
     )
     context.start(() => {
       expect(traced()).toBe(result)
@@ -121,7 +121,7 @@ for (const [kind, make] of Object.entries(targets)) {
       calls++
       return value
     }, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan() {} })(),
+      createTestWithOTel({ isActive: () => true, queueSpan() {} })(),
     )
     const random = vi
       .spyOn(crypto, 'getRandomValues')
@@ -143,7 +143,7 @@ for (const [kind, make] of Object.entries(targets)) {
     const value = { then }
     const sink = vi.fn()
     const traced = make(() => value, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan: sink })(),
+      createTestWithOTel({ isActive: () => true, queueSpan: sink })(),
     )
     context.start(() => {
       expect(traced()).toBe(value)
@@ -173,7 +173,7 @@ for (const [kind, make] of Object.entries(targets)) {
         throw new Error('sink failure')
       })
       const traced = make(() => original, 'traced').extend(
-        createWithOTel({ isActive: () => true, queueSpan: sink })(),
+        createTestWithOTel({ isActive: () => true, queueSpan: sink })(),
       )
       context.start(() => {
         expect(traced()).toBe(original)
@@ -197,7 +197,7 @@ for (const [kind, make] of Object.entries(targets)) {
     })
     const sink = vi.fn()
     const traced = make(() => original, 'traced').extend(
-      createWithOTel({ isActive: () => true, queueSpan: sink })(),
+      createTestWithOTel({ isActive: () => true, queueSpan: sink })(),
     )
     context.start(() => {
       expect(traced()).toBe(original)
@@ -210,7 +210,7 @@ for (const [kind, make] of Object.entries(targets)) {
 test('atom setter AbortError keeps thrown identity and emits exactly one error span', () => {
   const spans: SpanInput[] = []
   const traced = atom(0, 'abortingAtom').extend(
-    createWithOTel({
+    createTestWithOTel({
       isActive: () => true,
       queueSpan: (span) => spans.push(span),
     })(),
@@ -241,7 +241,7 @@ test('computed suspension Promise keeps thrown identity and emits zero spans', (
     calls++
     throw sentinel
   }, 'suspendingComputed').extend(
-    createWithOTel({
+    createTestWithOTel({
       isActive: () => true,
       queueSpan: (span) => spans.push(span),
     })(),

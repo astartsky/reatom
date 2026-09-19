@@ -2,7 +2,7 @@ import { expect, test, vi } from 'vitest'
 
 import { flushWithBeacon } from './flushWithBeacon.ts'
 
-const makePayload = (spans: unknown[]) => ({ resourceSpans: spans })
+const makePayload = (spans: readonly unknown[]) => ({ resourceSpans: spans })
 
 const beaconMock = (result: boolean) =>
   vi.fn<(url: string, data: BodyInit) => boolean>(() => result)
@@ -15,7 +15,7 @@ test('posts JSON Blob to endpoint via sendBeacon', () => {
     buildPayload: makePayload,
     sendBeacon,
   })
-  expect(ok).toBe(true)
+  expect(ok).toEqual({ accepted: true, selectedCount: 2 })
   expect(sendBeacon).toHaveBeenCalledTimes(1)
   const [url, blob] = sendBeacon.mock.calls[0]!
   expect(url).toBe('https://collector.example.com/v1/traces')
@@ -44,7 +44,7 @@ test('returns false when sendBeacon returns false', () => {
     buildPayload: makePayload,
     sendBeacon,
   })
-  expect(ok).toBe(false)
+  expect(ok.accepted).toBe(false)
 })
 
 test('returns true and skips sendBeacon when spans are empty', () => {
@@ -55,7 +55,7 @@ test('returns true and skips sendBeacon when spans are empty', () => {
     buildPayload: makePayload,
     sendBeacon,
   })
-  expect(ok).toBe(true)
+  expect(ok.accepted).toBe(true)
   expect(sendBeacon).not.toHaveBeenCalled()
 })
 
@@ -76,7 +76,7 @@ test('truncates oldest spans until payload fits maxBeaconBytes', () => {
 test('truncation keeps newest spans and drops oldest', async () => {
   const sendBeacon = beaconMock(true)
   const spans = [{ name: 'oldest' }, { name: 'middle' }, { name: 'newest' }]
-  flushWithBeacon({
+  const result = flushWithBeacon({
     endpoint: 'https://c.example',
     spans,
     buildPayload: makePayload,
@@ -87,6 +87,7 @@ test('truncation keeps newest spans and drops oldest', async () => {
   const text = await blob.text()
   const parsed = JSON.parse(text) as { resourceSpans: { name: string }[] }
   expect(parsed.resourceSpans.map((s) => s.name)).toEqual(['newest'])
+  expect(result).toEqual({ accepted: true, selectedCount: 1 })
 })
 
 test('returns false without calling sendBeacon when even one span exceeds limit', () => {
@@ -99,7 +100,7 @@ test('returns false without calling sendBeacon when even one span exceeds limit'
     maxBeaconBytes: 10,
     sendBeacon,
   })
-  expect(ok).toBe(false)
+  expect(ok.accepted).toBe(false)
   expect(sendBeacon).not.toHaveBeenCalled()
 })
 
@@ -112,5 +113,5 @@ test('returns false (no throw) when navigator.sendBeacon is unavailable', () => 
     buildPayload: makePayload,
     // Intentionally no `sendBeacon` injection; navigator is undefined here.
   })
-  expect(ok).toBe(false)
+  expect(ok.accepted).toBe(false)
 })

@@ -1,6 +1,19 @@
 import type { MockInstance } from 'vitest'
 import { vi } from 'vitest'
 
+import type { SpanInput } from './buildSpan.ts'
+import { createWithOTel } from './withOTel.ts'
+
+/** Always-admitting sink for middleware unit tests; production uses the queue. */
+export const createTestWithOTel = (input: {
+  queueSpan: (span: SpanInput) => void
+  isActive: () => boolean
+}) =>
+  createWithOTel({
+    isActive: input.isActive,
+    reserveSpan: () => ({ commit: input.queueSpan, cancel() {}, skip() {} }),
+  })
+
 /**
  * Decodes an OTLP span's attribute KeyValue array into a plain record of
  * stringValue payloads. Used by the unit and integration test suites to assert

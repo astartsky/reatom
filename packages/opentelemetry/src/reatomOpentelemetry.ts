@@ -10,20 +10,19 @@ import {
 import { buildExportPayload } from './buildExportPayload.ts'
 import type { OtlpSpan, SpanInput } from './buildSpan.ts'
 import { buildSpan } from './buildSpan.ts'
+import type { Reservation, TelemetryStats } from './createBatchQueue.ts'
 import { createBatchQueue } from './createBatchQueue.ts'
+import { createExportWorker } from './createExportWorker.ts'
 import { flushWithBeacon } from './flushWithBeacon.ts'
 import { hexFromBytes } from './hexFromBytes.ts'
 import { observe } from './observation.ts'
+import { resolveQueueOptions } from './queueOptions.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
 import type { RetryWithBackoffInput } from './retryWithBackoff.ts'
 import { retryWithBackoff } from './retryWithBackoff.ts'
 import { sendTraces } from './sendTraces.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
 import { createWithOTel } from './withOTel.ts'
-
-const DEFAULT_BATCH_INTERVAL_MS = 3000
-const DEFAULT_MAX_BATCH_SIZE = 100
-const DEFAULT_MAX_QUEUE_SIZE = 1000
 
 // Type-aware stable serializer for resource-attribute grouping. JSON.stringify
 // is unsafe here: it throws on bigint and emits non-canonical "{0:1,1:2,...}"
@@ -75,6 +74,8 @@ export interface ReatomOpentelemetryInput {
   batchInterval?: number
   maxBatchSize?: number
   maxQueueSize?: number
+  /** Budget for each batch export and, separately, each flush caller. */
+  exportTimeoutMs?: number
   maxBeaconBytes?: number
   /**
    * Opt-in to `navigator.sendBeacon` for unload-time delivery. Default:
@@ -112,8 +113,10 @@ export interface ReatomOpentelemetryInput {
 
 export interface ReatomOpentelemetry {
   withOTel: ReturnType<typeof createWithOTel>
-  /** Force-flush the queue. Returns when the in-flight batch fetch settles. */
+  /** Wait for finished records present at invocation, up to exportTimeoutMs. */
   flush: () => Promise<void>
+  /** Immutable snapshot of capacity, delivery and losses. */
+  stats: () => TelemetryStats
   /** Unregister the global extension, stop timers, remove unload listener. */
   dispose: () => void
 }
@@ -121,6 +124,7 @@ export interface ReatomOpentelemetry {
 export const reatomOpentelemetry = (
   input: ReatomOpentelemetryInput,
 ): ReatomOpentelemetry => {
+  const queueOptions = resolveQueueOptions(input)
   // OTel mandate: a tracer must never escalate. Log once, move on.
   // Aborts after dispose() are expected — gate at the single sink so
   // every call site (queue.onError, keepalive .catch) inherits it.
@@ -141,19 +145,6 @@ export const reatomOpentelemetry = (
   )
   const version = input.version ?? ''
 
-  const inflight = new Set<Promise<unknown>>()
-  // Consume both fates: removes the entry and prevents the chained promise
-  // itself from surfacing as an unhandled rejection. The original `send` is
-  // still returned so createBatchQueue's onError (and Promise.allSettled in
-  // flush) see the failure.
-  const track = <P extends Promise<unknown>>(send: P): P => {
-    inflight.add(send)
-    const cleanup = () => inflight.delete(send)
-    send.then(cleanup, cleanup)
-    return send
-  }
-  const abortController = new AbortController()
-
   // Each queue item carries its own resourceAttributesVar snapshot so a
   // span dropped at maxQueueSize cannot taint the batch made of survivors.
   // Items are grouped at flush time so spans with different resource
@@ -164,7 +155,7 @@ export const reatomOpentelemetry = (
     resourceAttributes?: Record<string, OtlpAttrValue>
   }
   const groupItemsByResource = (
-    items: QueueItem[],
+    items: readonly QueueItem[],
   ): Array<{
     resourceAttributes: Record<string, OtlpAttrValue>
     spans: OtlpSpan[]
@@ -196,82 +187,103 @@ export const reatomOpentelemetry = (
     return [...groups.values()]
   }
 
-  const queue = createBatchQueue<QueueItem>({
-    batchInterval: input.batchInterval ?? DEFAULT_BATCH_INTERVAL_MS,
-    maxBatchSize: input.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
-    maxQueueSize: input.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE,
-    flush: (items) => {
-      const groups = groupItemsByResource(items).map((g) => ({
-        resourceAttributes: g.resourceAttributes,
+  const payload = (items: readonly QueueItem[]) =>
+    buildExportPayload({
+      groups: groupItemsByResource(items).map((group) => ({
+        ...group,
         version,
-        spans: g.spans,
-      }))
-      // retryWithBackoff resolves with the last Response after exhaustion;
-      // throw on non-2xx so onError surfaces the drop.
-      const send = retryWithBackoff({
+      })),
+    })
+  const worker = createExportWorker<QueueItem>({
+    exportTimeoutMs: queueOptions.exportTimeoutMs,
+    onError: logExportError,
+    onQuarantine: (count) =>
+      observe(() =>
+        console.warn(
+          `[@reatom/opentelemetry] transport did not settle after abort; holding ${count} records`,
+        ),
+      ),
+    send: async (items, { signal, deadline, keepalive }) => {
+      const body = payload(items)
+      const response = await retryWithBackoff({
+        ...input.retry,
+        ...(keepalive ? { maxRetries: 0 } : {}),
+        signal,
+        deadline,
         send: () =>
           sendTraces({
             endpoint: input.endpoint,
-            payload: buildExportPayload({ groups }),
+            payload: body,
             headers: input.headers,
             fetch: input.fetch,
-            signal: abortController.signal,
+            signal,
+            keepalive,
           }),
-        signal: abortController.signal,
-        ...input.retry,
-      }).then(async (response) => {
-        if (!response.ok) {
-          // statusText is empty under HTTP/2; trim avoids "HTTP 503 ".
-          throw new Error(
-            `HTTP ${response.status} ${response.statusText}`.trimEnd(),
-          )
-        }
-        // OTLP partial success: spec allows a 2xx body
-        // `{ partialSuccess: { rejectedSpans, errorMessage } }` to signal
-        // a subset was rejected. Body parse is best-effort — many collectors
-        // return empty bodies.
-        let parsed:
-          | {
-              partialSuccess?: { rejectedSpans?: number; errorMessage?: string }
-            }
-          | undefined
-        try {
-          const text = await response.text()
-          if (!text) return
-          parsed = JSON.parse(text)
-        } catch {
-          return
-        }
-        const ps = parsed?.partialSuccess
-        if (
-          ps &&
-          typeof ps.rejectedSpans === 'number' &&
-          ps.rejectedSpans > 0
-        ) {
-          console.warn(
-            `[@reatom/opentelemetry] OTLP export to ${input.endpoint}: partialSuccess rejected ${ps.rejectedSpans} spans${ps.errorMessage ? ': ' + ps.errorMessage : ''}`,
-          )
-        }
       })
-      return track(send)
+      if (!response.ok) {
+        await response.body?.cancel()
+        throw new Error(
+          `HTTP ${response.status} ${response.statusText}`.trimEnd(),
+        )
+      }
+      // A failed body read is an export failure, never an empty success.
+      const text = await response.text()
+      let parsed:
+        | { partialSuccess?: { rejectedSpans?: number; errorMessage?: string } }
+        | undefined
+      try {
+        if (text) parsed = JSON.parse(text)
+      } catch {}
+      const ps = parsed?.partialSuccess
+      const rejected =
+        typeof ps?.rejectedSpans === 'number' ? ps.rejectedSpans : 0
+      if (
+        !Number.isSafeInteger(rejected) ||
+        rejected < 0 ||
+        rejected > items.length
+      ) {
+        throw new Error('Invalid OTLP rejectedSpans')
+      }
+      if (rejected)
+        observe(() =>
+          console.warn(
+            `[@reatom/opentelemetry] OTLP export to ${input.endpoint}: partialSuccess rejected ${rejected} spans${ps?.errorMessage ? ': ' + ps.errorMessage : ''}`,
+          ),
+        )
+      return {
+        exported: items.length - rejected,
+        beaconAccepted: 0,
+        droppedByReason: rejected ? { export: rejected } : {},
+      }
     },
-    onError: logExportError,
   })
-
-  // Atoms/actions instrumented before `dispose()` keep their bound
-  // middleware; `disposed` makes their continued queueSpan calls a no-op
-  // so we don't accumulate spans into a queue that will never flush.
+  const queue = createBatchQueue<QueueItem>({
+    ...queueOptions,
+    send: worker.send,
+    onError: logExportError,
+    isQuarantined: worker.isQuarantined,
+    onFlushTimeout: (unfinished) =>
+      observe(() =>
+        console.warn(
+          `[@reatom/opentelemetry] flush_timeout: ${unfinished} records unfinished`,
+        ),
+      ),
+  })
   let disposed = false
-  const queueSpan = (span: SpanInput) => {
-    if (disposed) return
-    // Read inside the user's frame chain (queueSpan runs from withOTel's
-    // middleware where `top()` is the action's frame, with pubs intact).
-    queue.push({
-      span: buildSpan(span),
-      resourceAttributes: resourceAttributesVar.get(),
-    })
+  const reserveSpan = (): Reservation<SpanInput> | undefined => {
+    const reservation = queue.reserve()
+    if (!reservation) return
+    return {
+      commit: (span) =>
+        reservation.commit({
+          span: buildSpan(span),
+          resourceAttributes: resourceAttributesVar.get(),
+        }),
+      cancel: reservation.cancel,
+      skip: reservation.skip,
+    }
   }
-  const withOTel = createWithOTel({ queueSpan, isActive: () => !disposed })
+  const withOTel = createWithOTel({ reserveSpan, isActive: () => !disposed })
 
   const globalExt: Ext = (target) => {
     if (input.filter && !input.filter(target)) return target
@@ -281,46 +293,38 @@ export const reatomOpentelemetry = (
 
   const flushNow = () => {
     if (disposed) return
-    // Default: keepalive fetch — beacon triggers a CORS preflight that
-    // browsers cannot run during page unload. See useBeacon docstring.
+    const lease = queue.takeForUnload()
+    if (!lease) return
     if (input.useBeacon !== true) {
-      const items = queue.drain()
-      if (items.length === 0) return
-      const groups = groupItemsByResource(items).map((g) => ({
-        resourceAttributes: g.resourceAttributes,
-        version,
-        spans: g.spans,
-      }))
-      track(
-        sendTraces({
-          endpoint: input.endpoint,
-          payload: buildExportPayload({ groups }),
-          headers: input.headers,
-          fetch: input.fetch,
-          keepalive: true,
-          signal: abortController.signal,
-        }).catch((error) => logExportError(error, items)),
-      )
+      worker.send(lease, true)
       return
     }
-    const beaconItems = queue.drain()
-    const ok = flushWithBeacon({
-      endpoint: input.endpoint,
-      spans: beaconItems,
-      // Re-group survivors so dropped oldest items don't taint groupings
-      // and each surviving resource bucket still goes to its own resourceSpans.
-      buildPayload: (survivors) =>
-        buildExportPayload({
-          groups: groupItemsByResource(survivors).map((g) => ({
-            resourceAttributes: g.resourceAttributes,
-            version,
-            spans: g.spans,
-          })),
-        }),
-      maxBeaconBytes: input.maxBeaconBytes,
-      sendBeacon: input.sendBeacon,
-    })
-    if (!ok) logExportError(new Error('beacon delivery failed'), beaconItems)
+    try {
+      const result = flushWithBeacon({
+        endpoint: input.endpoint,
+        spans: lease.items,
+        buildPayload: payload,
+        maxBeaconBytes: input.maxBeaconBytes,
+        sendBeacon: input.sendBeacon,
+      })
+      lease.release({
+        exported: 0,
+        beaconAccepted: result.accepted ? result.selectedCount : 0,
+        droppedByReason: {
+          oversized: lease.items.length - result.selectedCount,
+          export: result.accepted ? 0 : result.selectedCount,
+        },
+      })
+      if (!result.accepted)
+        logExportError(new Error('beacon delivery failed'), lease.items)
+    } catch (error) {
+      lease.release({
+        exported: 0,
+        beaconAccepted: 0,
+        droppedByReason: { export: lease.items.length },
+      })
+      logExportError(error, lease.items)
+    }
   }
 
   const onVisibilityChange = () => {
@@ -344,23 +348,13 @@ export const reatomOpentelemetry = (
 
   return {
     withOTel,
-    flush: async () => {
-      // Loop: pagehide-keepalive sends and concurrent queue.push() during
-      // the await can grow inflight after our snapshot. allSettled absorbs
-      // export rejections so they never escalate.
-      while (true) {
-        queue.flush()
-        if (inflight.size === 0) return
-        await Promise.allSettled([...inflight])
-      }
-    },
+    stats: queue.stats,
+    flush: queue.flush,
     dispose: () => {
+      if (disposed) return
       disposed = true
-      // Drop pending items; README documents dispose does not flush.
-      queue.drain()
-      // Cancels in-flight retry sleeps and fetches so a sleeping backoff
-      // can't post minutes after teardown.
-      abortController.abort()
+      queue.dispose()
+      worker.dispose()
       removeItem(EXTENSIONS, globalExt)
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onVisibilityChange)

@@ -11,6 +11,7 @@ import {
 
 import type { SpanInput, SpanKind } from './buildSpan.ts'
 import type { SpanEventInput } from './buildSpanEvent.ts'
+import type { Reservation } from './createBatchQueue.ts'
 import type { SpanId } from './generateSpanId.ts'
 import { generateSpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
@@ -26,11 +27,8 @@ export interface WithOTelOptions {
 }
 
 export interface CreateWithOTelInput {
-  /**
-   * Receives a fully-formed SpanInput when an instrumented atom/action
-   * finishes.
-   */
-  queueSpan: (span: SpanInput) => void
+  /** Admission precedes IDs, context writes and inspection of user values. */
+  reserveSpan: () => Reservation<SpanInput> | undefined
   /**
    * Checked before starting observation and at completion, before inspecting
    * user values. The adapter supplies its lifecycle state.
@@ -96,7 +94,7 @@ const exceptionEvent = (error: unknown, timeMs: number): SpanEventInput => {
  * doesn't double-emit.
  */
 export const createWithOTel = ({
-  queueSpan,
+  reserveSpan,
   isActive,
 }: CreateWithOTelInput) => {
   const optionsByTarget = new WeakMap<AtomLike, WithOTelOptions>()
@@ -117,7 +115,7 @@ export const createWithOTel = ({
       // explicit `setStatus(OK)` retains its signal. Errors and explicit
       // failures emit `error`; AbortError/Suspension are control flow and
       // route through `emitErr`'s `cf` branch (status unset, payload note).
-      const startMiddleware = () => {
+      const startMiddleware = (queueSpan: (span: SpanInput) => void) => {
         // Anchor wall clock once and measure duration via a monotonic source
         // so NTP steps cannot produce negative endTime - startTime.
         const startTimeMs = Date.now()
@@ -172,17 +170,34 @@ export const createWithOTel = ({
         (next: Fn, ...params: any[]) => {
           if (!isActive()) return next(...params)
 
-          const span = observe(startMiddleware)
+          const reservation = observe(reserveSpan)
+          if (!reservation) return next(...params)
+          const span = observe(() => startMiddleware(reservation.commit))
+          if (!span) {
+            observe(() => reservation.cancel('observation'))
+            return next(...params)
+          }
           const prevState = actionTarget ? undefined : top().state
           let completed = false
           const complete = (callback: () => void) => {
             if (completed) return
             completed = true
-            if (isActive()) observe(callback)
+            observe(() => {
+              if (!isActive()) {
+                reservation.cancel('disposed')
+                return
+              }
+              try {
+                callback()
+              } finally {
+                // No-op after commit/skip; releases failures during observation.
+                reservation.cancel('observation')
+              }
+            })
           }
           const success = (value: unknown) =>
             complete(() => {
-              span?.queueWith(
+              span.queueWith(
                 actionTarget
                   ? { params: serialize(params), payload: serialize(value) }
                   : {
@@ -195,20 +210,21 @@ export const createWithOTel = ({
             complete(() => {
               if (!actionTarget && !async) {
                 // Preserve atom-set error semantics and suspension control flow.
-                if (!(error instanceof Promise)) span?.queueErr(error)
-              } else span?.emitErr(error)
+                if (error instanceof Promise) reservation.skip()
+                else span.queueErr(error)
+              } else span.emitErr(error)
             })
 
           let result
           try {
             result = next(...params)
           } catch (error) {
-            if (span) failure(error, false)
+            failure(error, false)
             throw error
           }
 
-          if (span && isActive())
-            observe(() => {
+          if (isActive()) {
+            const attached = observe(() => {
               if (result instanceof Promise) {
                 result
                   .then(
@@ -217,7 +233,10 @@ export const createWithOTel = ({
                   )
                   .catch(() => {})
               } else success(result)
+              return true
             })
+            if (!attached) complete(() => {})
+          } else observe(() => reservation.cancel('disposed'))
           return result
         }
 

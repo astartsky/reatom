@@ -231,15 +231,17 @@ test('auto-instrumented atom still emits prevState/nextState', async () => {
   expect(transition).toBeDefined()
 })
 
-// `flush()` must await ALL in-flight batches, not just the most recent. If
-// the queue overflowed and triggered a size-flush while a prior interval-
-// flush is still in-flight, both promises must settle before flush resolves.
-test('flush() awaits all in-flight batches, not just the most recent', async () => {
+test('flush() waits for its queued and in-flight snapshot through serial exports', async () => {
   const deferreds: Array<(r: Response) => void> = []
+  let secondStarted!: () => void
+  const second = new Promise<void>((resolve) => {
+    secondStarted = resolve
+  })
   const fetchMock = vi.fn<typeof globalThis.fetch>(
     () =>
       new Promise<Response>((resolve) => {
         deferreds.push(resolve)
+        if (deferreds.length === 2) secondStarted()
       }),
   )
   const { otel } = setup({
@@ -247,34 +249,25 @@ test('flush() awaits all in-flight batches, not just the most recent', async () 
     maxBatchSize: 1,
     fetch: fetchMock,
   })
-
   const a = action(() => 'a', 'a')
   const b = action(() => 'b', 'b')
-
   context.start(() => {
     a()
     b()
   })
-
-  // Microtasks: both retryWithBackoff bodies advance to `await send()` and
-  // call fetchMock, parking on the deferred Response promises.
-  await new Promise<void>((r) => setTimeout(r, 0))
-  expect(fetchMock).toHaveBeenCalledTimes(2)
-
-  // Resolve ONLY the second batch's fetch.
-  deferreds[1]!(new Response('{}', { status: 200 }))
-
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(otel.stats()).toMatchObject({ queued: 1, inFlight: 1 })
   let flushSettled = false
-  const flushPromise = otel.flush().then(() => {
+  const flush = otel.flush().then(() => {
     flushSettled = true
   })
-  // Give microtasks time; flush should still be pending on batch 1.
-  await new Promise<void>((r) => setTimeout(r, 20))
+  deferreds[0]!(new Response('{}'))
+  await second
   expect(flushSettled).toBe(false)
-
-  deferreds[0]!(new Response('{}', { status: 200 }))
-  await flushPromise
-  expect(flushSettled).toBe(true)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  deferreds[1]!(new Response('{}'))
+  await flush
+  expect(otel.stats()).toMatchObject({ queued: 0, inFlight: 0, exported: 2 })
 })
 
 // iOS Safari fires `pagehide` without flipping `visibilityState` to 'hidden'

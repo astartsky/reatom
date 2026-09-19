@@ -2,8 +2,8 @@ import { tracesUrl } from './tracesUrl.ts'
 
 export interface FlushWithBeaconInput<T> {
   endpoint: string
-  spans: T[]
-  buildPayload: (spans: T[]) => unknown
+  spans: readonly T[]
+  buildPayload: (spans: readonly T[]) => unknown
   maxBeaconBytes?: number
   sendBeacon?: (url: string, data: BodyInit) => boolean
 }
@@ -20,14 +20,15 @@ const DEFAULT_MAX_BEACON_BYTES = 63_000
  * payload fits `maxBeaconBytes`. Newest spans win: those are closest to the
  * unload that triggered the flush.
  *
- * Empty `spans` is a trivial success. Returns `false` when even a single span
- * exceeds the limit or when `sendBeacon` itself rejects the payload (queue
- * full).
+ * Returns the number selected by the byte limit and whether the browser
+ * accepted them. Acceptance transfers ownership; delivery is not confirmed.
  *
  * https://developer.mozilla.org/en-US/docs/Web/API/Navigator/sendBeacon
  */
-export const flushWithBeacon = <T>(input: FlushWithBeaconInput<T>): boolean => {
-  if (input.spans.length === 0) return true
+export const flushWithBeacon = <T>(
+  input: FlushWithBeaconInput<T>,
+): { accepted: boolean; selectedCount: number } => {
+  if (input.spans.length === 0) return { accepted: true, selectedCount: 0 }
 
   // SSR / JSDOM / older browsers may have `document` but no `navigator.sendBeacon`.
   // Bail out as a delivery failure rather than throwing inside an unload handler.
@@ -37,7 +38,7 @@ export const flushWithBeacon = <T>(input: FlushWithBeaconInput<T>): boolean => {
       ? navigator.sendBeacon.bind(navigator)
       : undefined
   const sendBeacon = input.sendBeacon ?? fallback
-  if (!sendBeacon) return false
+  if (!sendBeacon) return { accepted: false, selectedCount: input.spans.length }
   const maxBytes = input.maxBeaconBytes ?? DEFAULT_MAX_BEACON_BYTES
   const url = tracesUrl(input.endpoint)
 
@@ -46,17 +47,23 @@ export const flushWithBeacon = <T>(input: FlushWithBeaconInput<T>): boolean => {
   let lo = 0
   let hi = input.spans.length - 1
   let bestBlob: Blob | undefined
+  let selectedCount = 0
   while (lo <= hi) {
     const mid = (lo + hi) >>> 1
     const body = JSON.stringify(input.buildPayload(input.spans.slice(mid)))
     const blob = new Blob([body], { type: 'application/json' })
     if (blob.size <= maxBytes) {
       bestBlob = blob
+      selectedCount = input.spans.length - mid
       hi = mid - 1
     } else {
       lo = mid + 1
     }
   }
-  if (!bestBlob) return false
-  return sendBeacon(url, bestBlob)
+  if (!bestBlob) return { accepted: false, selectedCount: 0 }
+  try {
+    return { accepted: sendBeacon(url, bestBlob), selectedCount }
+  } catch {
+    return { accepted: false, selectedCount }
+  }
 }

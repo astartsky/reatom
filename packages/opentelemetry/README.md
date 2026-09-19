@@ -91,6 +91,7 @@ reatomOpentelemetry({
   batchInterval?: number                             // default 3000 ms
   maxBatchSize?: number                              // default 100
   maxQueueSize?: number                              // default 1000
+  exportTimeoutMs?: number                           // default 30000; separate batch and flush budgets
   maxBeaconBytes?: number                            // default 63000 (under 64 KB browser limit, beacon path only)
   useBeacon?: boolean                                // default false; opt-in for same-origin collectors without auth headers
   retry?: {                                          // OTLP retry tuning; defaults: 3 retries, 1s base, 30s cap, full jitter
@@ -106,7 +107,8 @@ The factory returns:
 ```ts
 {
   withOTel: (options?: { kind?: SpanKind }) => Ext   // see "Per-target overrides" below
-  flush: () => Promise<void>                         // forces the queue out and awaits all in-flight batches
+  flush: () => Promise<void>                         // waits for the finished records present at invocation
+  stats: () => TelemetryStats                        // immutable capacity and delivery snapshot
   dispose: () => void                                // unregisters the global extension and unload listeners
 }
 ```
@@ -242,9 +244,51 @@ batch queue's `onError`** — the tracer never escalates failures to your app.
 
 ### `flush()` semantics
 
-`await otel.flush()` drains the queue **and** awaits every in-flight batch
-(via `Promise.allSettled`). Useful in tests, on shutdown, or before
-navigation. Rejections are absorbed: `flush()` always resolves.
+`await otel.flush()` waits for the queued and in-flight records present when
+it is called. It does not wait for unfinished application actions or records
+created later. Errors are reported through diagnostics and statistics;
+`flush()` resolves even when delivery fails.
+
+Each call has its own `exportTimeoutMs` waiting budget. Expiry reports
+`flush_timeout` and stops that caller waiting; it neither aborts the shared
+transport nor drops queued records. Each batch independently gets the same
+time budget for sending, retry delays and response-body cleanup. A batch
+deadline requests abort. The next request starts only after the previous
+request and its body have settled.
+
+`maxQueueSize` counts active spans, queued records and in-flight records
+together. Admission happens before IDs and value capture; incoming spans
+are dropped when capacity is exhausted. A never-settling application Promise
+occupies an active slot until settlement or disposal. Telemetry does not
+cancel the application. At most one fetch export runs at a time, with no
+more than `maxBatchSize` records per batch. `Retry-After` is never shortened
+to the local backoff cap; if it exceeds the remaining batch budget, that
+batch is dropped as a timeout.
+
+Queue sizes must be positive safe integers. Timer budgets must be finite,
+positive and within the native timer range (up to 2147483647 ms). Invalid
+options throw before installing the global extension.
+
+`otel.stats()` returns `active`, `queued`, `inFlight`, `exported`, `dropped`,
+`droppedByReason`, `beaconAccepted`, `flushTimeouts` and
+`transportQuarantined`. The snapshot and its reason counters are immutable.
+Reasons are `capacity`, `oversized`, `disposed`, `export`, `timeout` and
+`observation`. `oversized` covers both record limits and available unload
+byte budget; `observation` covers failures while inspecting or recording an
+execution. Synchronous suspension emits no record and releases its slot
+without counting a loss. A flush wait timeout does not itself increment
+`dropped`.
+
+An injected transport that ignores abort keeps its in-flight slot until it
+actually settles. This is visible through `transportQuarantined` and one
+warning; it prevents a hung transport from spawning more requests. Normal
+native fetch aborts settle without entering this persistent state. A late
+success cannot override an earlier batch timeout or disposal outcome.
+
+Unload uses the same transport slot and takes at most `maxBatchSize` of the
+newest queued records. If the slot is busy, records remain queued. Beacon
+acceptance is a terminal handoff to the browser, counted as `beaconAccepted`,
+not confirmed delivery in `exported`.
 
 ### Serialization
 
@@ -276,8 +320,10 @@ await otel.flush()
 otel.dispose()
 ```
 
-`dispose()` is a hard stop: in-flight retries are aborted and any not-yet-
-exported spans are lost. Graceful shutdown must `await flush()` first.
+`dispose()` releases active and queued records immediately and requests abort
+of the current export. In-flight records stay accounted for until transport
+and body cleanup settle. Graceful shutdown should `await flush()` first;
+resolution of `flush()` alone is not proof of delivery.
 
 Existing instrumented targets keep their application behavior after disposal.
 They no longer generate IDs, measure time, inspect values or export spans.

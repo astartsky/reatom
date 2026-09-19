@@ -12,7 +12,7 @@ import type { SpanInput } from './buildSpan.ts'
 import { spanIdVar } from './spanIdVar.ts'
 import { HEX_SPAN_ID, HEX_TRACE_ID } from './test-helpers.ts'
 import { traceIdVar } from './traceIdVar.ts'
-import { createWithOTel } from './withOTel.ts'
+import { createTestWithOTel } from './test-helpers.ts'
 
 const collectSpans = () => {
   const spans: SpanInput[] = []
@@ -24,7 +24,7 @@ const collectSpans = () => {
 
 test('async action instrumentation survives minified core middleware names', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
   const originalName = actionMiddleware.name
   try {
     Object.defineProperty(actionMiddleware, 'name', { value: 'a' })
@@ -43,7 +43,7 @@ test('async action instrumentation survives minified core middleware names', asy
 
 test('sync action records a span with name, params, payload, and unset status', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const greet = action((name: string) => `hi ${name}`, 'greet').extend(
     withOTel(),
@@ -72,7 +72,7 @@ test('sync action records a span with name, params, payload, and unset status', 
 
 test('respects kind option override', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const fetchUser = action(() => 1, 'fetchUser').extend(
     withOTel({ kind: 'client' }),
@@ -87,7 +87,7 @@ test('respects kind option override', () => {
 
 test('nested actions share traceId; inner span has parentSpanId pointing at the outer', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const inner = action(() => 'inner-result', 'inner').extend(withOTel())
   const outer = action(() => inner(), 'outer').extend(withOTel())
@@ -106,7 +106,7 @@ test('nested actions share traceId; inner span has parentSpanId pointing at the 
 
 test('async action records span when the promise resolves with unset status', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const fetchData = action(async () => {
     await wrap(sleep(0))
@@ -125,7 +125,7 @@ test('async action records span when the promise resolves with unset status', as
 
 test('async action records span with error status when the promise rejects', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const broken = action(async () => {
     throw new Error('boom')
@@ -143,7 +143,7 @@ test('async action records span with error status when the promise rejects', asy
 
 test('synchronous throw in an action records error span and rethrows', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const broken = action((): number => {
     throw new Error('bad')
@@ -168,7 +168,7 @@ test('synchronous throw in an action records error span and rethrows', () => {
 // https://opentelemetry.io/docs/specs/semconv/exceptions/exception-spans/
 test('async action rejection emits an `exception` event per OTel semconv', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const broken = action(async () => {
     throw new TypeError('boom')
@@ -194,7 +194,7 @@ test('async action rejection emits an `exception` event per OTel semconv', async
 
 test('sync action throw emits an `exception` event', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const broken = action((): number => {
     throw new RangeError('out')
@@ -212,7 +212,7 @@ test('sync action throw emits an `exception` event', () => {
 
 test('AbortError is control flow — no `exception` event emitted', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const aborted = action(async () => {
     throw new DOMException('Aborted', 'AbortError')
@@ -229,7 +229,7 @@ test('AbortError is control flow — no `exception` event emitted', async () => 
 
 test('non-Error throw still records exception event with sane defaults', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const broken = action(async () => {
     throw 'string-throw'
@@ -249,7 +249,7 @@ test('non-Error throw still records exception event with sane defaults', async (
 
 test('atom records a span with prev/next state on setter call', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const counter = atom(0, 'counter').extend(withOTel())
 
@@ -267,7 +267,7 @@ test('atom records a span with prev/next state on setter call', () => {
 
 test('inside an entry-point spawn, the var is seeded once and reused across siblings', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const a = action(() => 'a', 'a').extend(withOTel())
   const b = action(() => 'b', 'b').extend(withOTel())
@@ -291,7 +291,7 @@ test('inside an entry-point spawn, the var is seeded once and reused across sibl
 
 test('bare sibling actions in the same context.start get distinct traces', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const a = action(() => 'a', 'a').extend(withOTel())
   const b = action(() => 'b', 'b').extend(withOTel())
@@ -309,7 +309,7 @@ test('bare sibling actions in the same context.start get distinct traces', () =>
 
 test('repeated calls to the same action get distinct root traces', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const a = action(() => 'a', 'a').extend(withOTel())
 
@@ -326,7 +326,7 @@ test('repeated calls to the same action get distinct root traces', () => {
 
 test('repeated calls to the same async action get distinct root traces', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const a = action(async () => {
     await wrap(sleep(0))
@@ -346,7 +346,7 @@ test('repeated calls to the same async action get distinct root traces', async (
 
 test('two concurrent async invocations of the same action get distinct root traces', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const a = action(async () => {
     await wrap(sleep(0))
@@ -365,7 +365,7 @@ test('two concurrent async invocations of the same action get distinct root trac
 
 test('repeated set on the same atom gets distinct root traces', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const counter = atom(0, 'counter').extend(withOTel())
 
@@ -383,7 +383,7 @@ test('repeated set on the same atom gets distinct root traces', () => {
 
 test('an async action followed by a sync sibling does not adopt the async one as parent', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const asyncA = action(async () => 'a', 'asyncA').extend(withOTel())
   const syncB = action(() => 'b', 'syncB').extend(withOTel())
@@ -406,7 +406,7 @@ test('an async action followed by a sync sibling does not adopt the async one as
 // propagation that breaks this would silently fragment async traces.
 test('child action invoked after `await wrap(...)` inherits the parent trace', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
   const child = action(() => 'c', 'child').extend(withOTel())
   const parent = action(async () => {
@@ -438,7 +438,7 @@ test('thrown queueSpan inside an async action does not become an unhandled rejec
     const queueSpan = vi.fn(() => {
       throw new Error('hostile sink')
     })
-    const withOTel = createWithOTel({ queueSpan, isActive: () => true })
+    const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
     const fetchData = action(async () => 'done', 'fetchData').extend(withOTel())
 
