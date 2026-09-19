@@ -1,4 +1,4 @@
-import type { AtomLike, GenericExt } from '@reatom/core'
+import type { AtomLike, Fn, GenericExt } from '@reatom/core'
 import {
   bind,
   isAbort,
@@ -15,6 +15,7 @@ import type { SpanId } from './generateSpanId.ts'
 import { generateSpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
 import { generateTraceId } from './generateTraceId.ts'
+import { observe } from './observation.ts'
 import { serialize } from './serialize.ts'
 import { spanIdVar } from './spanIdVar.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
@@ -30,6 +31,11 @@ export interface CreateWithOTelInput {
    * finishes.
    */
   queueSpan: (span: SpanInput) => void
+  /**
+   * Checked before starting observation and at completion, before inspecting
+   * user values. The adapter supplies its lifecycle state.
+   */
+  isActive: () => boolean
 }
 
 interface SpanContext {
@@ -89,7 +95,10 @@ const exceptionEvent = (error: unknown, timeMs: number): SpanEventInput => {
  * `addGlobalExtension(withOTel())` plus a local `withOTel({ kind })` override
  * doesn't double-emit.
  */
-export const createWithOTel = ({ queueSpan }: CreateWithOTelInput) => {
+export const createWithOTel = ({
+  queueSpan,
+  isActive,
+}: CreateWithOTelInput) => {
   const optionsByTarget = new WeakMap<AtomLike, WithOTelOptions>()
   const installed = new WeakSet<AtomLike>()
 
@@ -157,79 +166,65 @@ export const createWithOTel = ({ queueSpan }: CreateWithOTelInput) => {
         return { queueWith, queueErr, emitErr }
       }
 
-      if (isAction(target)) {
-        return target.extend(
-          withActionMiddleware(() => (next, ...params) => {
-            const { queueWith, emitErr } = startMiddleware()
+      const actionTarget = isAction(target)
+      const middleware =
+        () =>
+        (next: Fn, ...params: any[]) => {
+          if (!isActive()) return next(...params)
 
-            try {
-              const result = next(...params)
-              const okAttrs = (payload: unknown) => ({
-                params: serialize(params),
-                payload: serialize(payload),
-              })
+          const span = observe(startMiddleware)
+          const prevState = actionTarget ? undefined : top().state
+          let completed = false
+          const complete = (callback: () => void) => {
+            if (completed) return
+            completed = true
+            if (isActive()) observe(callback)
+          }
+          const success = (value: unknown) =>
+            complete(() => {
+              span?.queueWith(
+                actionTarget
+                  ? { params: serialize(params), payload: serialize(value) }
+                  : {
+                      prevState: serialize(prevState),
+                      nextState: serialize(value),
+                    },
+              )
+            })
+          const failure = (error: unknown, async: boolean) =>
+            complete(() => {
+              if (!actionTarget && !async) {
+                // Preserve atom-set error semantics and suspension control flow.
+                if (!(error instanceof Promise)) span?.queueErr(error)
+              } else span?.emitErr(error)
+            })
 
+          let result
+          try {
+            result = next(...params)
+          } catch (error) {
+            if (span) failure(error, false)
+            throw error
+          }
+
+          if (span && isActive())
+            observe(() => {
               if (result instanceof Promise) {
                 result
                   .then(
-                    bind((payload: unknown) => queueWith(okAttrs(payload))),
-                    bind((error: unknown) => emitErr(error)),
+                    bind(success),
+                    bind((error: unknown) => failure(error, true)),
                   )
-                  // OTel mandate: never escalate. Swallow if a sink throws.
                   .catch(() => {})
-              } else {
-                queueWith(okAttrs(result))
-              }
-
-              return result
-            } catch (error) {
-              emitErr(error)
-              throw error
-            }
-          }),
-        )
-      }
-
-      return target.extend(
-        withMiddleware(() => (next, ...params) => {
-          // Set context before next() so synchronous child instrumentation
-          // (cause atoms, child actions) parents to this span instead of
-          // opening a fresh root trace.
-          const { queueWith, queueErr, emitErr } = startMiddleware()
-
-          try {
-            const prevState = top().state
-            const nextState = next(...params)
-            const okAttrs = (resolvedState: unknown) => ({
-              prevState: serialize(prevState),
-              nextState: serialize(resolvedState),
+              } else success(result)
             })
+          return result
+        }
 
-            if (nextState instanceof Promise) {
-              nextState
-                .then(
-                  bind((resolvedState: unknown) =>
-                    queueWith(okAttrs(resolvedState)),
-                  ),
-                  bind((error: unknown) => emitErr(error)),
-                )
-                .catch(() => {})
-            } else {
-              queueWith(okAttrs(nextState))
-            }
-
-            return nextState
-          } catch (atomChangeError) {
-            // Suspension is Reatom control flow; rethrow without emitting.
-            if (atomChangeError instanceof Promise) throw atomChangeError
-            // Sync throw out of an atom set is always a real error: an
-            // AbortError here did not come from an awaited abort, so bypass
-            // emitErr's control-flow check.
-            queueErr(atomChangeError)
-            throw atomChangeError
-          }
-        }),
-      )
+      if (isAction(target)) {
+        return target.extend(withActionMiddleware(middleware))
+      }
+      return target.extend(withMiddleware(middleware))
     }) as GenericExt<AtomLike>
   }
 }

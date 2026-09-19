@@ -13,6 +13,7 @@ import { buildSpan } from './buildSpan.ts'
 import { createBatchQueue } from './createBatchQueue.ts'
 import { flushWithBeacon } from './flushWithBeacon.ts'
 import { hexFromBytes } from './hexFromBytes.ts'
+import { observe } from './observation.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
 import type { RetryWithBackoffInput } from './retryWithBackoff.ts'
 import { retryWithBackoff } from './retryWithBackoff.ts'
@@ -125,14 +126,15 @@ export const reatomOpentelemetry = (
   // every call site (queue.onError, keepalive .catch) inherits it.
   // `dropped` lets ops correlate failure pressure with traffic — a 1-span
   // drop and a 100-span drop look identical without it.
-  const logExportError = (error: unknown, dropped?: readonly unknown[]) => {
-    if (isAbort(error)) return
-    const detail = dropped ? ` (dropped ${dropped.length} spans)` : ''
-    console.warn(
-      `[@reatom/opentelemetry] OTLP export to ${input.endpoint} failed${detail}:`,
-      error,
-    )
-  }
+  const logExportError = (error: unknown, dropped?: readonly unknown[]) =>
+    observe(() => {
+      if (isAbort(error)) return
+      const detail = dropped ? ` (dropped ${dropped.length} spans)` : ''
+      console.warn(
+        `[@reatom/opentelemetry] OTLP export to ${input.endpoint} failed${detail}:`,
+        error,
+      )
+    })
   const resourceAttributes: Record<string, OtlpAttrValue> = merge(
     { 'service.name': input.serviceName },
     input.resourceAttributes,
@@ -269,7 +271,7 @@ export const reatomOpentelemetry = (
       resourceAttributes: resourceAttributesVar.get(),
     })
   }
-  const withOTel = createWithOTel({ queueSpan })
+  const withOTel = createWithOTel({ queueSpan, isActive: () => !disposed })
 
   const globalExt: Ext = (target) => {
     if (input.filter && !input.filter(target)) return target

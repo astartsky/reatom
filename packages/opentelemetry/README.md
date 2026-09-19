@@ -279,8 +279,17 @@ otel.dispose()
 `dispose()` is a hard stop: in-flight retries are aborted and any not-yet-
 exported spans are lost. Graceful shutdown must `await flush()` first.
 
+Existing instrumented targets keep their application behavior after disposal.
+They no longer generate IDs, measure time, inspect values or export spans.
+Pending application promises continue normally; their later completion is
+ignored by the disposed adapter.
+
 ## Limitations
 
+- Instrumentation returns the original Promise and preserves its outcome.
+  Observing rejection still affects the host's `unhandledrejection` and
+  `rejectionHandled` events; complete transparency of those events is not
+  guaranteed. The adapter handles failures in its own observer chains.
 - v1 ships **traces only** — no metrics, no logs, no W3C `traceparent`
   propagation to outgoing fetches, no offline buffering, no compression.
 - Trace context is read from the caller frame on the JS call stack. If you
