@@ -1,5 +1,3 @@
-import { context, named, STACK, top, variable } from '@reatom/core'
-
 import type { SpanId } from './generateSpanId.ts'
 import { generateSpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
@@ -9,9 +7,6 @@ export type SpanContext = Readonly<{ traceId: TraceId; spanId: SpanId }>
 export const ROOT_BOUNDARY = Symbol('OTel root boundary')
 export type ContextSlot = SpanContext | typeof ROOT_BOUNDARY
 
-export const isOTelInternal = (target: { name: string }): boolean =>
-  target.name.startsWith('var#_reatomOtelContext#')
-
 export const createChildContext = (parent?: ContextSlot): SpanContext =>
   Object.freeze({
     traceId:
@@ -20,48 +15,24 @@ export const createChildContext = (parent?: ContextSlot): SpanContext =>
   })
 
 export const createSpanContext = () => {
-  // Variable's helper actions also use this reserved, instance-unique name.
-  let acquired = false
+  let value: ContextSlot | undefined
   let disposed = false
-  const slot = variable<ContextSlot>(named('_reatomOtelContext'))
-  const record = (from = STACK.length - 1) => {
-    for (let i = from; i >= 0; i--) {
-      const snapshot = STACK[i]!._continuationContext
-      if (snapshot) return snapshot
-    }
-    return undefined
-  }
-  const read = (from?: number): ContextSlot | undefined =>
-    record(from)?.[slot.name] as ContextSlot | undefined
   return {
-    read,
+    read: () => value,
     dispose: () => {
       disposed = true
-      if (!acquired) return
-      acquired = false
-      context._continuationContextConsumers!--
+      value = undefined
     },
-    write: (value: ContextSlot, frame = top()) => {
-      if (disposed) return
-      if (!acquired) {
-        acquired = true
-        context._continuationContextConsumers =
-          (context._continuationContextConsumers ?? 0) + 1
-      }
-      frame._continuationContext = Object.freeze({
-        ...record(),
-        [slot.name]: value,
-      })
+    write: (next: ContextSlot) => {
+      if (!disposed) value = next
     },
-    save: (frame = top()) => {
-      const snapshot = frame._continuationContext
+    save: () => {
+      const saved = value
       return () => {
-        frame._continuationContext = snapshot
+        if (!disposed) value = saved
       }
     },
-    current: (): SpanContext | undefined => {
-      const value = read()
-      return value === ROOT_BOUNDARY ? undefined : value
-    },
+    current: (): SpanContext | undefined =>
+      value === ROOT_BOUNDARY ? undefined : value,
   }
 }

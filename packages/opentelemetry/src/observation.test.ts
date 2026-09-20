@@ -3,44 +3,6 @@ import { expect, test } from 'vitest'
 
 import { observe } from './observation.ts'
 
-test('nested observation keeps the outer restriction and does not retain it across await', async () => {
-  await context.start(async () => {
-    let calls = 0
-    let refusals = 0
-    const lazy = atom(() => ++calls)
-    const gate = Promise.withResolvers<void>()
-    const pending = observe(() => {
-      observe(() => {
-        throw new Error('nested observation')
-      })
-      try {
-        lazy()
-      } catch {
-        refusals++
-      }
-      try {
-        context.start(() => lazy())
-      } catch {
-        refusals++
-      }
-      return (async () => {
-        await wrap(gate.promise)
-        return lazy()
-      })()
-    })
-    try {
-      expect(refusals).toBe(2)
-      expect(calls).toBe(0)
-      gate.resolve()
-      expect(await pending).toBe(1)
-      expect(calls).toBe(1)
-    } finally {
-      gate.resolve()
-      await pending
-    }
-  })
-})
-
 test.each([false, true])(
   'observation restores dependency tracking after callback (throws=%s)',
   async (throwing: boolean) => {

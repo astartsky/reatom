@@ -39,14 +39,13 @@ test('R12 shares ambient resource override across adapters but owns both resourc
   }
   try {
     const [overridden, defaults] = run(() => [
-      action(() => {
-        resourceAttributesVar.set(override)
-        return 'R12_override_app_value'
-      }, 'resource-policy.r12-overridden'),
+      action(() => 'R12_override_app_value', 'resource-policy.r12-overridden'),
       action(() => 'R12_defaults_app_value', 'resource-policy.r12-defaults'),
     ])
 
-    expect(run(overridden)).toBe('R12_override_app_value')
+    expect(run(() => resourceAttributesVar.run(override, overridden))).toBe(
+      'R12_override_app_value',
+    )
     override.tenant.nested = 'R12_override_nested_late'
     override.array[0] = 'R12_override_array_late'
     override.bytes.fill(9)

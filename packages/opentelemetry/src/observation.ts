@@ -1,15 +1,16 @@
-import { context, peek, STACK } from '@reatom/core'
+import { peek, STACK } from '@reatom/core'
 
-/** Observer failures and reads must not affect the application's computation. */
+let depth = 0
+export const isObserving = () => depth !== 0
+
+/** Isolate dependency tracking and swallow telemetry callback failures. */
 export const observe = <T>(callback: () => T): T | undefined => {
-  const previous = context._observation
-  context._observation = true
+  depth++
   try {
-    // Transport callbacks can run outside a Reatom invocation.
     return STACK.length ? peek(callback) : callback()
   } catch {
     return undefined
   } finally {
-    context._observation = previous
+    depth--
   }
 }

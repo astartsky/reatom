@@ -180,6 +180,17 @@ export function verifyTypes() {
   )
   expectExact<Equal<typeof _taggedResult, typeof taggedPromise>>()
   expectExact<Equal<typeof _taggedResult.tag, 'kept'>>()
+  const pair = otel.getCurrentContext()
+  const _contextResult = otel.withContext(pair, () => syncValue)
+  const _contextPromise = otel.withContext(pair, () => taggedPromise)
+  expectExact<Equal<typeof _contextResult, typeof syncValue>>()
+  expectExact<Equal<typeof _contextPromise, typeof taggedPromise>>()
+  otel.withContext(undefined, () => syncValue)
+  // @ts-expect-error a context requires a complete ID pair
+  otel.withContext({ traceId: pair!.traceId }, () => syncValue)
+  // @ts-expect-error withContext does not supply callback arguments
+  otel.withContext(pair, (value: number) => value)
+
   // @ts-expect-error startTrace does not accept callbacks requiring arguments
   otel.startTrace('types.badCallback', (value: number) => value)
 }

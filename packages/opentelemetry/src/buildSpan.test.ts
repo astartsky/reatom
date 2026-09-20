@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
 
-import { buildSpan, type SpanInput } from './buildSpan.ts'
+import { buildSpan } from './buildSpan.ts'
 import type { SpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
 
@@ -59,65 +59,6 @@ test('includes parentSpanId when provided', () => {
   })
   expect(span.parentSpanId).toBe(PARENT_SPAN_ID)
 })
-
-test('encodes complete link pairs without changing the execution parent', () => {
-  const links = Object.freeze([
-    Object.freeze({
-      traceId: TRACE_ID,
-      spanId: '3333333333333333' as SpanId,
-    }),
-    Object.freeze({
-      traceId: '11111111111111111111111111111111' as TraceId,
-      spanId: '2222222222222222' as SpanId,
-    }),
-  ])
-  const span = buildSpan({
-    traceId: TRACE_ID,
-    spanId: SPAN_ID,
-    parentSpanId: PARENT_SPAN_ID,
-    name: 'linked',
-    startTimeMs: 0,
-    endTimeMs: 1,
-    links,
-  })
-  const wire = JSON.parse(JSON.stringify(span))
-  expect(wire.links).toEqual(links)
-  expect(wire.parentSpanId).toBe(PARENT_SPAN_ID)
-  expect(wire.traceId).toBe(TRACE_ID)
-  expect(wire.spanId).toBe(SPAN_ID)
-})
-
-test('owns link pairs after the input is mutated', () => {
-  const links = [{ traceId: TRACE_ID, spanId: PARENT_SPAN_ID }]
-  const span = buildSpan({
-    traceId: TRACE_ID,
-    spanId: SPAN_ID,
-    name: 'linked-root',
-    startTimeMs: 0,
-    endTimeMs: 1,
-    links,
-  })
-  links[0]!.spanId = SPAN_ID
-  links.push({ traceId: TRACE_ID, spanId: SPAN_ID })
-  const wire = JSON.parse(JSON.stringify(span))
-  expect(wire.links).toEqual([{ traceId: TRACE_ID, spanId: PARENT_SPAN_ID }])
-  expect(wire).not.toHaveProperty('parentSpanId')
-})
-
-test.each([undefined, []])(
-  'omits an empty links field (%j)',
-  (links: SpanInput['links']) => {
-    const span = buildSpan({
-      traceId: TRACE_ID,
-      spanId: SPAN_ID,
-      name: 'unlinked',
-      startTimeMs: 0,
-      endTimeMs: 1,
-      links,
-    })
-    expect(span).not.toHaveProperty('links')
-  },
-)
 
 test('maps span kind strings to integers', () => {
   const client = buildSpan({

@@ -19,6 +19,7 @@ test('context methods belong to each adapter', () => {
   })
   try {
     expect(typeof otel.startTrace).toBe('function')
+    expect(typeof otel.withContext).toBe('function')
     expect(typeof otel.getCurrentContext).toBe('function')
     expect(otel.getCurrentContext()).toBeUndefined()
   } finally {

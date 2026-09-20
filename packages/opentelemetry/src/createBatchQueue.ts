@@ -30,8 +30,6 @@ export interface TelemetryStats {
 export interface Reservation<T> {
   commit(record: T): void
   cancel(reason: DropReason): void
-  /** Release an intentionally unrecorded execution without counting a loss. */
-  skip(): void
 }
 
 export interface BatchLease<T> {
@@ -219,11 +217,6 @@ export const createBatchQueue = <T>(
           if (entry.state !== 'active') return
           active--
           droppedByReason[reason]++
-          settle(entry)
-        },
-        skip() {
-          if (entry.state !== 'active') return
-          active--
           settle(entry)
         },
       }

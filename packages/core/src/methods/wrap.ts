@@ -1,49 +1,8 @@
 import type { Frame } from '../core'
-import { context, run, STACK, top } from '../core'
-import {
-  captureContinuation,
-  enterContinuation,
-} from '../core/continuationContext'
+import { STACK, top } from '../core'
 import { type Fn, throwAbort } from '../utils'
 import { isAbort, noop } from '../utils'
 import { type AbortSubscription, abortVar } from './abortVar'
-
-function invokeWrapped(
-  frame: Frame,
-  root: Frame['root'],
-  captured: Frame['_continuationContext'],
-  target: Fn,
-  params: any[],
-) {
-  const restore = context._continuationContextConsumers
-    ? enterContinuation(frame, captured)
-    : undefined
-  try {
-    if (root !== frame.root) throwAbort('context reset')
-    abortVar.throwIfAborted(frame)
-    return target(...params)
-  } finally {
-    restore?.()
-  }
-}
-
-function runWrapped(
-  this: Frame,
-  root: Frame['root'],
-  captured: Frame['_continuationContext'],
-  target: Fn,
-  ...params: any[]
-) {
-  // Keep custom runners live, as in the ordinary wrap contract.
-  if (this.run !== run)
-    return this.run(() => invokeWrapped(this, root, captured, target, params))
-  try {
-    STACK.push(this)
-    return invokeWrapped(this, root, captured, target, params)
-  } finally {
-    STACK.pop()
-  }
-}
 
 /**
  * Preserves Reatom's reactive context across async boundaries or function
@@ -97,19 +56,24 @@ export let wrap: {
   frame = top(),
 ): T extends Fn ? ReturnType<T> : Promise<Awaited<T>> => {
   let { root } = frame
-  let captured = captureContinuation(frame)
 
   if (typeof target === 'function') {
     abortVar.throwIfAborted(frame)
 
-    return runWrapped.bind(frame, root, captured, target as Fn) as any
+    return function wrap(...params: any) {
+      return frame.run(() => {
+        if (root !== frame.root) throwAbort('context reset')
+        abortVar.throwIfAborted(frame)
+        // @ts-expect-error
+        return target(...params)
+      })
+    } as any
   }
 
   if (!(target instanceof Promise)) target = Promise.resolve(target) as T
 
   let abortSubscription: undefined | AbortSubscription
   let promise: undefined | Promise<Awaited<T>>
-  let restore: undefined | (() => void)
 
   let seal = (cb: Fn) => {
     // prevent unhandled error for abort
@@ -118,16 +82,9 @@ export let wrap: {
       abortSubscription.unsubscribe()
     }
 
-    queueMicrotask(() => {
-      STACK.push(frame)
-      if (context._continuationContextConsumers)
-        restore = enterContinuation(frame, captured)
-    })
+    queueMicrotask(() => void STACK.push(frame))
     cb()
-    queueMicrotask(() => {
-      restore?.()
-      STACK.pop()
-    })
+    queueMicrotask(() => void STACK.pop())
   }
 
   let aborted = false

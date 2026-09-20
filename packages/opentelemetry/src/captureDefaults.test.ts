@@ -1,4 +1,4 @@
-import { action, atom, bind, context } from '@reatom/core'
+import { action, bind, context } from '@reatom/core'
 import { expect, test } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
@@ -25,47 +25,7 @@ const setup = (traced: boolean, captureValues?: false) => {
   return { run, otel, bodies, spans: () => bodies.flatMap(parseSpans) }
 }
 
-for (const [mode, captureValues] of [
-  ['omitted', undefined],
-  ['false', false],
-] as const) {
-  test(`state span keeps private previous and next state out of the wire when captureValues is ${mode}`, async () => {
-    const { run, otel, bodies, spans } = setup(true, captureValues)
-    const previous = { private: 'default-state-previous-private-sentinel' }
-    const next = { private: 'default-state-next-private-sentinel' }
-    try {
-      const target = run(() => atom(previous, 'capture-default.state-privacy'))
-      expect(run(target)).toBe(previous)
-      expect(run(() => target.set(next))).toBe(next)
-      expect(run(target)).toBe(next)
-      expect(previous.private).toBe('default-state-previous-private-sentinel')
-      expect(next.private).toBe('default-state-next-private-sentinel')
-
-      await otel!.flush()
-      const stateSpans = spans().filter(
-        (span) => span.name === 'capture-default.state-privacy',
-      )
-      expect(stateSpans).toHaveLength(1)
-      expect(spans().map((span) => span.name)).toEqual([
-        'capture-default.state-privacy',
-      ])
-      for (const span of stateSpans) {
-        expect(span.attributes).not.toHaveProperty('prevState')
-        expect(span.attributes).not.toHaveProperty('nextState')
-      }
-      expect(bodies.join('')).not.toContain(
-        'default-state-previous-private-sentinel',
-      )
-      expect(bodies.join('')).not.toContain(
-        'default-state-next-private-sentinel',
-      )
-    } finally {
-      otel!.dispose()
-    }
-  })
-}
-
-for (const kind of ['params', 'payload', 'state', 'async-payload'] as const) {
+for (const kind of ['params', 'payload', 'async-payload'] as const) {
   test.each([false, true])(
     `default capture leaves ${kind} getters untouched (traced=%s)`,
     async (traced: boolean) => {
@@ -88,13 +48,6 @@ for (const kind of ['params', 'payload', 'state', 'async-payload'] as const) {
             : value
       try {
         const invoke = run(() => {
-          if (kind === 'state') {
-            const target = atom(() => {
-              bodyCalls++
-              return value
-            }, `capture-default.${kind}`)
-            return () => target()
-          }
           const target = action((received: unknown) => {
             bodyCalls++
             expect(received).toBe(input)
@@ -257,13 +210,14 @@ for (const source of ['factory', 'ambient'] as const) {
       try {
         // Factory data must already be owned before any execution starts.
         if (source === 'factory') mutate()
-        const target = run(() =>
-          action(() => {
-            if (source === 'ambient') resourceAttributesVar.set(attributes)
-            return 7
-          }, 'capture-default.resource'),
-        )
-        expect(run(target)).toBe(7)
+        const target = run(() => action(() => 7, 'capture-default.resource'))
+        expect(
+          run(() =>
+            source === 'ambient'
+              ? resourceAttributesVar.run(attributes, target)
+              : target(),
+          ),
+        ).toBe(7)
         if (source === 'ambient') mutate()
         expect(bodies).toHaveLength(0)
         expect(otel.stats().queued).toBe(1)

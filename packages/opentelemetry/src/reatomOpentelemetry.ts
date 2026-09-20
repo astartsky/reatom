@@ -1,11 +1,12 @@
 import type { AtomLike, Ext } from '@reatom/core'
 import {
   addGlobalExtension,
-  context,
   EXTENSIONS,
   isAbort,
+  isAction,
   isSkip,
   removeItem,
+  STACK,
 } from '@reatom/core'
 
 import { buildExportPayload } from './buildExportPayload.ts'
@@ -18,15 +19,14 @@ import { createBatchQueue } from './createBatchQueue.ts'
 import { createExportWorker } from './createExportWorker.ts'
 import { flushWithBeacon } from './flushWithBeacon.ts'
 import { hexFromBytes } from './hexFromBytes.ts'
-import { observe } from './observation.ts'
+import { isObserving, observe } from './observation.ts'
 import { parseExportResponse } from './parseExportResponse.ts'
 import { resolveQueueOptions } from './queueOptions.ts'
-import { readResourceAttributes } from './readResourceAttributes.ts'
+import { resourceAttributesVar } from './resourceAttributesVar.ts'
 import type { RetryWithBackoffInput } from './retryWithBackoff.ts'
 import { retryWithBackoff } from './retryWithBackoff.ts'
 import { selectUnloadBatch } from './selectUnloadBatch.ts'
 import { sendTraces } from './sendTraces.ts'
-import { isOTelInternal } from './spanContext.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
 import { availableUnloadBytes, reserveUnloadBytes } from './unloadBudget.ts'
 import { createWithOTel } from './withOTel.ts'
@@ -99,9 +99,8 @@ export interface ReatomOpentelemetryInput {
   captureValues?: false | { redact?: (key: string, value: unknown) => unknown }
   headers?: Record<string, string>
   /**
-   * Selects automatic spans. Filtered user targets still carry execution
-   * context through nested calls and wrap; no record or capture is created.
-   * Private adapter helpers are always excluded, before this predicate.
+   * Selects automatic action spans. Filtered actions retain the surrounding
+   * synchronous scope. Ordinary core bind/wrap do not capture this scope.
    */
   filter?: (target: AtomLike) => boolean
   batchInterval?: number
@@ -145,8 +144,10 @@ export interface ReatomOpentelemetry {
   withOTel: ReturnType<typeof createWithOTel>['withOTel']
   /** Start a separate root in the current store; preserve callback outcome. */
   startTrace: ReturnType<typeof createWithOTel>['startTrace']
-  /** Current immutable pair, or undefined outside an admitted execution. */
+  /** Current immutable pair, or undefined outside a synchronous trace scope. */
   getCurrentContext: ReturnType<typeof createWithOTel>['getCurrentContext']
+  /** Install a saved pair (or explicit absence) only for this synchronous call. */
+  withContext: ReturnType<typeof createWithOTel>['withContext']
   /** Wait for finished records present at invocation, up to exportTimeoutMs. */
   flush: () => Promise<void>
   /** Immutable snapshot of capacity, delivery and losses. */
@@ -156,7 +157,7 @@ export interface ReatomOpentelemetry {
 }
 
 /**
- * Install tracing before creating application targets. Values are excluded
+ * Install tracing before creating application actions. Values are excluded
  * unless captureValues is enabled; existing targets require local withOTel.
  * Flush before disposal when delivery should be attempted at shutdown.
  */
@@ -313,7 +314,7 @@ export const reatomOpentelemetry = (
     send: (lease) => {
       // A full batch can be committed before the observed execution settles.
       // Transport wrappers may read application state; run them after capture.
-      if (context._observation) queueMicrotask(() => worker.send(lease))
+      if (isObserving()) queueMicrotask(() => worker.send(lease))
       else worker.send(lease)
     },
     onError: logExportError,
@@ -329,6 +330,22 @@ export const reatomOpentelemetry = (
   const reserveSpan = (): Reservation<SpanInput> | undefined => {
     const reservation = queue.reserve()
     if (!reservation) return
+    // Capture ambient Resource at admission; async completion retains no Frame.
+    let resources: Record<string, OtlpAttrValue>
+    try {
+      if (!resourceAttributes) throw new Error('Invalid Resource')
+      const override = STACK.length ? resourceAttributesVar.get() : undefined
+      resources =
+        override === undefined
+          ? resourceAttributes
+          : {
+              ...resourceAttributes,
+              ...resourceSnapshot(createValueCapture(), override),
+            }
+    } catch {
+      reservation.cancel('observation')
+      return
+    }
     return {
       commit: (span) => {
         if (!resourceAttributes) {
@@ -344,14 +361,6 @@ export const reatomOpentelemetry = (
           reservation.cancel('oversized')
           return
         }
-        const override = readResourceAttributes()
-        const resources =
-          override === undefined
-            ? resourceAttributes
-            : {
-                ...resourceAttributes,
-                ...resourceSnapshot(createValueCapture(), override),
-              }
         const record = { span: buildSpan(span), resourceAttributes: resources }
         const size = encoder.encode(
           JSON.stringify({
@@ -364,7 +373,6 @@ export const reatomOpentelemetry = (
         else reservation.commit(record)
       },
       cancel: reservation.cancel,
-      skip: reservation.skip,
     }
   }
   const tracing = createWithOTel({
@@ -374,10 +382,11 @@ export const reatomOpentelemetry = (
   })
 
   const globalExt: Ext = (target) => {
-    if (isOTelInternal(target)) return target
+    if (!isAction(target) || isObserving()) return target
     return tracing.auto(
       target,
-      !isSkip(target) && (input.filter ? !!input.filter(target) : true),
+      !isSkip(target) &&
+        (input.filter ? observe(() => !!input.filter!(target)) === true : true),
     )
   }
   addGlobalExtension(globalExt)
@@ -473,6 +482,7 @@ export const reatomOpentelemetry = (
     withOTel: tracing.withOTel,
     startTrace: tracing.startTrace,
     getCurrentContext: tracing.getCurrentContext,
+    withContext: tracing.withContext,
     stats: queue.stats,
     flush: queue.flush,
     dispose: () => {

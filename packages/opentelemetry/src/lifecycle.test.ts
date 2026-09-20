@@ -1,4 +1,4 @@
-import { action, atom, computed, context } from '@reatom/core'
+import { action, atom, context } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import type { CaptureValuesOptions } from './captureValues.ts'
@@ -113,7 +113,7 @@ test('after dispose: action call and atom.set preserve identity/state with zero 
       expect(work() === payload).toBe(true)
       const beforeSetter = captures
       expect(counter.set(1)).toBe(1)
-      expect(captures).toBeGreaterThan(beforeSetter)
+      expect(captures).toBe(beforeSetter)
     })
     expect(reads.ownKeys).toBeGreaterThan(0)
     expect(reads.descriptors).toBeGreaterThan(0)
@@ -148,78 +148,70 @@ test('after dispose: action call and atom.set preserve identity/state with zero 
   }
 })
 
-for (const kind of ['action', 'computed'] as const) {
-  for (const reject of [false, true]) {
-    test(`${kind}: ${reject ? 'rejection' : 'fulfillment'} after disposal does not inspect or enqueue`, async () => {
-      const { otel, fetchMock } = setup({})
-      const { value, reads } = captureProbe({ secret: 'sentinel' })
-      let finish!: (value: unknown) => void
-      const original = new Promise<unknown>((resolve, fail) => {
-        finish = reject ? fail : resolve
-      })
-      const outcome = original.then(
+for (const reject of [false, true]) {
+  test(`action: ${reject ? 'rejection' : 'fulfillment'} after disposal does not inspect or enqueue`, async () => {
+    const { otel, fetchMock } = setup({})
+    const { value, reads } = captureProbe({ secret: 'sentinel' })
+    let finish!: (value: unknown) => void
+    const original = new Promise<unknown>((resolve, fail) => {
+      finish = reject ? fail : resolve
+    })
+    const outcome = original.then(
+      (result) => ({ ok: true, value: result }),
+      (error) => ({ ok: false, value: error }),
+    )
+    try {
+      // Exercise the same kind and settlement with capture enabled before
+      // testing the disposal guard; safe capture never calls getters.
+      const live = Promise.withResolvers<unknown>()
+      const liveOutcome = live.promise.then(
         (result) => ({ ok: true, value: result }),
         (error) => ({ ok: false, value: error }),
       )
-      try {
-        // Exercise the same kind and settlement with capture enabled before
-        // testing the disposal guard; safe capture never calls getters.
-        const live = Promise.withResolvers<unknown>()
-        const liveOutcome = live.promise.then(
-          (result) => ({ ok: true, value: result }),
-          (error) => ({ ok: false, value: error }),
-        )
-        const liveTarget =
-          kind === 'action'
-            ? action(() => live.promise, 'liveControl')
-            : computed(() => live.promise, 'liveControl')
-        expect(context.start(() => liveTarget()) === live.promise).toBe(true)
-        if (reject) live.reject(value)
-        else live.resolve(value)
-        const liveSettled = await liveOutcome
-        await Promise.resolve()
-        expect(liveSettled.ok).toBe(!reject)
-        expect(liveSettled.value === value).toBe(true)
-        expect(reads.ownKeys).toBeGreaterThan(0)
-        expect(reads.descriptors).toBeGreaterThan(0)
-        await otel.flush()
-        expect(fetchMock).toHaveBeenCalledTimes(1)
-        fetchMock.mockClear()
-        reads.ownKeys = reads.descriptors = 0
+      const liveTarget = action(() => live.promise, 'liveControl')
+      expect(context.start(() => liveTarget()) === live.promise).toBe(true)
+      if (reject) live.reject(value)
+      else live.resolve(value)
+      const liveSettled = await liveOutcome
+      await Promise.resolve()
+      expect(liveSettled.ok).toBe(!reject)
+      expect(liveSettled.value === value).toBe(true)
+      expect(reads.ownKeys).toBeGreaterThan(0)
+      expect(reads.descriptors).toBeGreaterThan(0)
+      await otel.flush()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      fetchMock.mockClear()
+      reads.ownKeys = reads.descriptors = 0
 
-        let calls = 0
-        const pending = () => {
-          calls++
-          return original
-        }
-        const target =
-          kind === 'action'
-            ? action(pending, 'pending')
-            : computed(pending, 'pending')
-        // Start while active so completion, rather than the entry guard, is tested.
-        context.start(() => {
-          const start = withClockCount(() => target())
-          expect(start.result).toBe(original)
-          expect(start.ticks).toBeGreaterThan(0)
-          expect(start.ids).toBeGreaterThan(0)
-        })
-        expect(calls).toBe(1)
-        expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
-        otel.dispose()
-        finish(value)
-        const settled = await outcome
-        await Promise.resolve()
-        expect(settled.ok).toBe(!reject)
-        expect(settled.value === value).toBe(true)
-        expect(calls).toBe(1)
-        expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
-        await otel.flush()
-        expect(fetchMock).not.toHaveBeenCalled()
-      } finally {
-        otel.dispose()
+      let calls = 0
+      const pending = () => {
+        calls++
+        return original
       }
-    })
-  }
+      const target = action(pending, 'pending')
+      // Start while active so completion, rather than the entry guard, is tested.
+      context.start(() => {
+        const start = withClockCount(() => target())
+        expect(start.result).toBe(original)
+        expect(start.ticks).toBeGreaterThan(0)
+        expect(start.ids).toBeGreaterThan(0)
+      })
+      expect(calls).toBe(1)
+      expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
+      otel.dispose()
+      finish(value)
+      const settled = await outcome
+      await Promise.resolve()
+      expect(settled.ok).toBe(!reject)
+      expect(settled.value === value).toBe(true)
+      expect(calls).toBe(1)
+      expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
+      await otel.flush()
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      otel.dispose()
+    }
+  })
 }
 
 test('after dispose: sync throw keeps error identity without error-field inspection', async () => {

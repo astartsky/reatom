@@ -65,7 +65,7 @@ test('suspension and hostile-error observation free capacity; later work exports
 
     const original = new Error('application failure')
     let failingCalls = 0
-    const failing = computed(() => {
+    const failing = action(() => {
       failingCalls++
       throw original
     }, 'failing')

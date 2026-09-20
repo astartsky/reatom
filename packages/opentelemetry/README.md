@@ -1,9 +1,9 @@
 # @reatom/opentelemetry
 
 OpenTelemetry tracing for [Reatom](https://www.reatom.dev). Auto-instruments
-atoms and actions, batches spans, and ships them to any
+actions, batches spans, and ships them to any
 [OTLP/HTTP JSON](https://opentelemetry.io/docs/specs/otlp/#otlphttp) collector.
-No OpenTelemetry SDK dependency.
+No OpenTelemetry SDK dependency or changes to `@reatom/core`.
 
 ## Install
 
@@ -23,7 +23,7 @@ const otel = reatomOpentelemetry({
   version: '1.0.0',
 })
 
-// Eligible atoms/actions created from this point on emit execution metadata.
+// Eligible actions created from this point on emit execution metadata.
 // Parameter and result values are not captured by default.
 // Import modules that create application models after installing tracing.
 await wrap(import('./app.ts'))
@@ -50,25 +50,14 @@ const otel = reatomOpentelemetry({
 
 ## Trace context model
 
-Spans describe actual executions: action calls, lazy initializer bodies,
-computed bodies and atom writes (including equal-value writes). Cached reads
-and dependency validation without recomputation emit no span. A constant atom's
-initial value has no initializer body to observe.
+Spans describe action calls and explicit `startTrace` operations. Atoms,
+computed values, initializers and setters keep their ordinary behavior and do
+not emit spans. There are no automatic reactive dependency links.
 
-Reads made while inspecting telemetry are untracked and cannot start lazy
-initialization, computed validation or custom read middleware. Plain atom data
-can be read without entering its pipeline; cold user-supplied `createAtom`
-setups are not inspected. A refused read is an observation failure. These
-restrictions cover the whole synchronous observation callback, including work
-it explicitly invokes. The observed application body and async continuations
-run outside that scope. Explicit writes, actions and subscriptions made by
-observation callbacks remain their own effects and are not rolled back; a
-refused read in such a write can leave the target's ordinary cached error.
-
-Each adapter keeps its own immutable `{ traceId, spanId }` pair on the executing
-Reatom frame. Children inherit that execution parent; reading cached reactive
-data does not adopt the data's old trace. Independent calls begin separate
-traces. Use `await wrap(promise)` to preserve the Reatom context across an await.
+Each adapter keeps its own immutable `{ traceId, spanId }` pair for the current
+synchronous call. Nested instrumented actions inherit that parent. Independent
+calls begin separate traces; reading cached reactive data does not adopt an
+old trace.
 
 Use an explicit root to group sibling operations:
 
@@ -82,86 +71,78 @@ otel.startTrace('checkout', () => {
 const current = otel.getCurrentContext() // Readonly<{ traceId, spanId }> | undefined
 ```
 
-`startTrace` creates a real root span, even inside another trace. It preserves
-the callback's result, original Promise or thrown value, reactive dependency
-tracking, current store and cancellation scope. After it returns, the outer
-context is restored. A disposed
-adapter calls the callback directly. `getCurrentContext()` returns `undefined`
-outside an admitted execution or after disposal.
+`startTrace` creates a root even inside another trace. It preserves the
+callback's result, original Promise or thrown value, reactive dependency
+tracking, current store and cancellation scope. The outer trace context is
+restored as soon as the callback returns, including when it returns a Promise.
+A disposed adapter calls the callback directly.
 
-`wrap` and `bind` preserve the trace context captured for each continuation,
-including overlapping computations on one Reatom frame and the absence of a
-trace when registered outside one. Calling an older callback inside a new trace
-does not attach it to that trace. Only integration context is snapshotted;
-application state and ordinary Reatom variables retain their usual behavior.
+### Async context
 
-The first traced execution enables continuation context handling for this Reatom
-runtime. While any adapter that has used it remains active, `bind`/`wrap` capture
-context and temporarily restore it on resume. Disposing the last such adapter
-returns subsequent calls to the path without context lookup or installation.
-Older callbacks still preserve their registration context, including absence,
-if another adapter later enables tracing. Disposal during a running continuation
-does not prevent restoration of its caller's context.
-The shared consumer count is still checked at registration and resume to detect
-later activation.
+Reatom's `bind` and `wrap` retain their original behavior. They preserve Reatom
+state and cancellation context, but do not capture this adapter's trace context.
+Capture the pair before yielding and use `withContext` around work that should
+continue that trace:
 
-If capacity rejects an ordinary span, its children retain any admitted parent.
-If capacity rejects an explicit root, an ID-free boundary prevents children
-from adopting the outer trace, including after `await wrap`. Once capacity is
-available, each admitted child begins a fresh trace; its own children inherit
-it normally. This deliberately loses sibling grouping under overload instead
-of inventing a root span that was never admitted. Later export loss does not
-rewrite already inherited IDs.
+```ts
+const load = action(async () => {
+  const parent = otel.getCurrentContext()
+  const response = await wrap(fetch('/api/items'))
+  return otel.withContext(parent, () => acceptResponse(response))
+}, 'load')
+```
+
+`withContext(pair, callback)` copies the pair, runs the callback synchronously,
+and restores the caller's context in `finally`. It preserves the original
+result, Promise and thrown value. If its callback also yields, re-enter the
+saved context after that await. `withContext(undefined, callback)` explicitly
+clears the parent for that call; it does not create a span. This also works for
+external event handlers. Use Reatom's `bind` or `wrap` separately when the handler
+needs a Reatom store or cancellation scope.
+
+`getCurrentContext()` returns `undefined` outside these synchronous scopes or
+after disposal. A callback invoked later without `withContext` sees the context
+of its caller, not the context where the callback was registered.
+
+If capacity rejects an ordinary span, its children retain the current admitted
+parent. If capacity rejects an explicit root, its callback runs with no parent.
+An admitted child then begins a fresh trace. Capture this absence explicitly
+with `withContext` when continuing after an await. Later export loss does not
+rewrite IDs already inherited by children.
 
 **Source-breaking change in this unreleased API:** independent writable
-`traceIdVar` and `spanIdVar` exports are removed. Read the coherent pair through
-`otel.getCurrentContext()` and establish roots through `otel.startTrace()`.
-There is no setter for partial IDs, SDK context bridge or remote-parent API.
-`resourceAttributesVar` remains a separate, shared ambient resource override.
+`traceIdVar` and `spanIdVar` exports are removed. Use `getCurrentContext`,
+`startTrace` and `withContext` with coherent pairs. There is no SDK context
+bridge or automatic remote-parent propagation. `resourceAttributesVar` remains
+a separate, shared ambient resource override.
 
-### Links between changed inputs
-
-Reactive executions can include `links` to earlier observed executions that
-changed established inputs in the same Reatom store. Links contain complete
-`traceId`/`spanId` pairs and do not change the execution parent; a linked input
-may belong to an older trace. Equal state and error values, first reads, and
-newly added or removed dependencies do not produce links.
-
-The adapter compares the old and current dependency graphs synchronously. It
-selects the nearest eligible observed execution on each changed branch. When a
-copied frame has no context, it may follow that branch's changed inputs instead.
-It never substitutes the latest span for a target, or links the execution to
-itself or its own descendants. Ambiguous matches and unobserved causes can be
-omitted: these links describe established input changes, not complete historical
-causality.
-
-Each span retains at most 32 distinct pairs. Matching inspects at most 256
-dependency entries across both graphs; a branch whose complete local match
-does not fit is omitted. Only owned ID pairs survive synchronous completion.
-Weak frame keys hold execution metadata without retaining prior frames, values
-or dependency arrays, and disposal clears that metadata.
+Telemetry callbacks use untracked reads so their dependencies do not become
+application dependencies. Reentrant actions invoked by telemetry callbacks are
+not traced. These callbacks can still initialize state or perform other
+application work; their effects are not rolled back. Keep filters and redaction
+observational.
 
 ### Per-trace resource attributes
 
-`resourceAttributesVar` is a frame-scoped variable for attaching extra
-resource metadata to the spans emitted by a particular trace:
+`resourceAttributesVar` is a Reatom variable for attaching extra resource
+metadata to actions called within a scope. Set the override **before** calling
+the observed action:
 
 ```ts
 import { resourceAttributesVar } from '@reatom/opentelemetry'
 
-const trackExperiment = action(() => {
-  resourceAttributesVar.set({ 'feature.flag': 'experiment-a' })
-}, 'trackExperiment')
+resourceAttributesVar.run({ 'feature.flag': 'experiment-a' }, () =>
+  trackExperiment(),
+)
 ```
 
-Values merge into the construction-time `resourceAttributes` (var keys win)
-at queue time and ship on the next batch flush. Factory defaults are copied
-at construction; ambient overrides are copied when each span completes.
-These bounded snapshots own nested records, arrays and byte arrays, so later
-mutations do not change queued data. The ambient slot is intentionally shared:
-all adapters in the same Reatom frame see the override while keeping their
-own factory defaults. Prefer span attributes for session, user and route data;
-application keys are never automatically promoted to Resource attributes.
+Factory defaults are copied at construction. Ambient overrides are copied at
+span admission, before the action body, and override matching default keys.
+These bounded snapshots own nested records, arrays and byte arrays. Changes
+inside the action or after an await do not alter that span's Resource. The
+ambient slot is intentionally shared: adapters in the same Reatom scope see
+the override while keeping their own factory defaults. Application keys are
+never automatically promoted to Resource attributes.
 
 Spans with distinct resource
 attributes are placed in **separate `resourceSpans` entries** within one
@@ -179,7 +160,7 @@ reatomOpentelemetry({
   resourceAttributes?: Record<string, OtlpAttrValue> // extra resource attributes (e.g. deployment.environment)
   captureValues?: false | { redact?: (key: string, value: unknown) => unknown } // default false
   headers?: Record<string, string>                   // attached to every fetch (auth, API keys)
-  filter?: (target: AtomLike) => boolean             // select spans; filtered targets still carry context
+  filter?: (target: AtomLike) => boolean             // select actions for automatic instrumentation
   batchInterval?: number                             // default 3000 ms
   maxBatchSize?: number                              // default 100
   maxQueueSize?: number                              // default 1000
@@ -200,6 +181,7 @@ The factory returns:
 {
   withOTel: (options?: { kind?: SpanKind }) => Ext   // see "Per-target overrides" below
   startTrace: <T>(name: string, callback: () => T) => T // new root in the current store
+  withContext: <T>(pair: SpanContext | undefined, callback: () => T) => T // synchronous scope
   getCurrentContext: () => SpanContext | undefined   // immutable IDs for this adapter
   flush: () => Promise<void>                         // waits for the finished records present at invocation
   stats: () => TelemetryStats                        // immutable capacity and delivery snapshot
@@ -209,7 +191,7 @@ The factory returns:
 
 ### Span kind
 
-OTel `SpanKind` defaults to `internal`. Override per atom/action when the work
+OTel `SpanKind` defaults to `internal`. Override per action when the work
 crosses a process boundary so distributed-trace dashboards render it correctly:
 
 ```ts
@@ -229,14 +211,13 @@ reatomOpentelemetry({
 })
 ```
 
-Automatic spans also exclude targets hidden by Reatom's `isSkip`: names that
-start with `_` or contain `._`. The custom filter further narrows eligibility.
-Filtered user targets emit no span and do not reserve capacity or inspect
-values. They still receive an execution-context carrier so nested calls and
-`await wrap` preserve their admitted parent. This can install middleware on
-actions; it is not a promise of zero instrumentation overhead. Manual
-`.extend(otel.withOTel())` explicitly enables a filtered or hidden target. Private adapter
-helpers remain excluded before any custom filter, across all adapters.
+Automatic instrumentation only selects actions. It also excludes targets hidden
+by Reatom's `isSkip`: names that start with `_` or contain `._`. The custom filter
+further narrows eligibility. Filtered actions receive no telemetry middleware,
+emit no span and do not reserve capacity or inspect values. Their synchronous
+children still run in the caller's trace scope. Manual
+`.extend(otel.withOTel())` enables a filtered or hidden action. Applying the
+extension to an atom or computed value leaves it unchanged.
 
 ### Per-target overrides
 
@@ -256,19 +237,15 @@ const otel = reatomOpentelemetry({
 const save = action((id: number) => persist(id), 'save').extend(otel.withOTel())
 ```
 
-Filtered targets can still carry context to their children. The filter controls
-span admission, not an instrumentation-free execution mode.
-
 ## Span shape
 
 By default, spans contain execution metadata and no parameter, result or state
 values. With `captureValues: {}`, the additional attributes are:
 
-| Target              | Opt-in attributes on success      | Status on resolve | Status on reject                                     |
-| ------------------- | --------------------------------- | ----------------- | ---------------------------------------------------- |
-| Action (sync)       | `params`, `payload`               | unset             | `error` (unset for `AbortError` / suspension)        |
-| Action (async)      | `params`, `payload` (final value) | unset on resolve  | `error` on reject                                    |
-| Atom set / computed | `prevState`, `nextState`          | unset             | `error` (atom suspension is rethrown without a span) |
+| Target         | Opt-in attributes on success      | Status on success | Status on failure                  |
+| -------------- | --------------------------------- | ----------------- | ---------------------------------- |
+| Action (sync)  | `params`, `payload`               | unset             | `error`, except control flow below |
+| Action (async) | `params`, `payload` (final value) | unset             | `error`, except control flow below |
 
 Successful executions leave span status **unset**. Application failures use
 error status; cancellation and suspension follow the control-flow rules below.
@@ -276,7 +253,7 @@ error status; cancellation and suspension follow the control-flow rules below.
 Action `AbortError` and thrown `Promise` (Reatom's suspension primitive) are
 control flow: status stays **unset**, with fixed `[AbortError]` or `[Suspension]`
 markers by default. Opt-in abort reasons pass through capture and redaction.
-Synchronous atom suspension emits no span. Ordinary exceptions emit an
+Ordinary exceptions emit an
 `exception` event with only a safely obtained built-in `exception.type` by
 default (opaque exceptions use `Error`). Message, stack and status message
 require opt-in. `exception.escaped` is never inferred or emitted. This package
@@ -287,7 +264,7 @@ semantic conventions do not add a logs transport to this API.
 
 ### Auto-instrumentation timing
 
-The factory instruments eligible atoms and actions created after it is called.
+The factory instruments eligible actions created after it is called.
 Existing targets are not retroactively instrumented. To select a previously
 created target explicitly, apply `target.extend(otel.withOTel())` while the
 adapter is active. The extension preserves the target reference and its
@@ -402,8 +379,7 @@ options throw before installing the global extension.
 Reasons are `capacity`, `oversized`, `disposed`, `export`, `timeout` and
 `observation`. `oversized` covers both record limits and available unload
 byte budget; `observation` covers failures while inspecting or recording an
-execution. Synchronous suspension emits no record and releases its slot
-without counting a loss. A flush wait timeout does not itself increment
+execution. A flush wait timeout does not itself increment
 `dropped`.
 
 An injected transport that ignores abort keeps its in-flight slot until it
@@ -482,7 +458,9 @@ resolution of `flush()` alone is not proof of delivery.
 Existing instrumented targets keep their application behavior after disposal.
 They no longer generate IDs, measure time, inspect values or export spans.
 Pending application promises continue normally; their later completion is
-ignored by the disposed adapter.
+ignored by the disposed adapter. Installed action middleware remains and checks
+the disposed state. Promise completion callbacks remain attached until the
+application Promise settles; disposal does not cancel it.
 
 ## Limitations
 
@@ -492,9 +470,10 @@ ignored by the disposed adapter.
   guaranteed. The adapter handles failures in its own observer chains.
 - v1 ships **traces only** — no metrics, no logs, no W3C `traceparent`
   propagation to outgoing fetches, no offline buffering, no compression.
-- Trace context belongs to the Reatom execution stack. External callbacks need
-  `wrap(callback)` or a new explicit entry point; this package does not bridge
-  arbitrary third-party async context managers.
+- Trace context is synchronous and belongs to one adapter. Async continuations
+  and external callbacks need explicit `withContext` to retain an earlier
+  parent. There is no automatic tracing of reactive computations or dependency
+  links, and no bridge to third-party async context managers.
 
 ## Node / non-browser usage
 

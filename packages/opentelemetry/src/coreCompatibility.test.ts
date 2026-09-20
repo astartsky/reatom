@@ -69,12 +69,13 @@ test.each(['capture', 'throw', 'filtered'] as const)(
         return new Response(null)
       },
     })
-    const traced = run(() =>
-      computed(() => {
+    const traced = run(() => {
+      const work = action((value: number) => {
         tracedCalls++
-        return { value: source() }
-      }, 'compat.traced'),
-    )
+        return { value }
+      }, 'compat.traced')
+      return computed(() => work(source()), 'compat.consumer')
+    })
     const rawNotifications: number[] = []
     const tracedNotifications: number[] = []
     let unsubscribeRaw = () => {}

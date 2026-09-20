@@ -1,7 +1,6 @@
-import { action, atom, context } from '@reatom/core'
+import { action, context } from '@reatom/core'
 import { afterEach, expect, test, vi } from 'vitest'
 
-import type { OtlpSpan } from './buildSpan.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
 import {
@@ -102,7 +101,7 @@ test('filter excludes matching targets from auto-instrumentation', async () => {
   expect(names).not.toContain('private.hidden')
 })
 
-test('atoms created before reatomOpentelemetry are NOT auto-instrumented', async () => {
+test('actions created before reatomOpentelemetry are NOT auto-instrumented', async () => {
   const orphan = action(() => 'orphan-result', 'orphan')
 
   const { otel, fetchMock } = setup()
@@ -147,7 +146,7 @@ test('local withOTel override on a globally-instrumented action emits exactly on
   expect(matching[0].kind).toBe(3)
 })
 
-test('dispose unregisters auto-instrumentation so subsequent atoms emit no spans', async () => {
+test('dispose unregisters auto-instrumentation so subsequent actions emit no spans', async () => {
   const { otel, fetchMock } = setup()
   otel.dispose()
   cleanups.pop() // already disposed; avoid double-dispose in afterEach
@@ -205,30 +204,6 @@ test('auto-instrumented async action emits one span on resolve, not at synchrono
   )
   expect(matches).toHaveLength(1)
   expect(attrsOf(matches[0])).toHaveProperty('payload', 'done')
-})
-
-test('auto-instrumented atom still emits prevState/nextState', async () => {
-  const { otel, fetchMock } = setup({ captureValues: {} })
-
-  const counter = atom(0, 'counter')
-
-  context.start(() => {
-    counter.set(1)
-  })
-  await otel.flush()
-
-  const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)
-  const transition = body.resourceSpans[0].scopeSpans[0].spans.find(
-    (s: Pick<OtlpSpan, 'name' | 'attributes'>) => {
-      const attrs = attrsOf(s)
-      return (
-        s.name === 'counter' &&
-        attrs.prevState === '0' &&
-        attrs.nextState === '1'
-      )
-    },
-  )
-  expect(transition).toBeDefined()
 })
 
 test('flush() waits for its queued and in-flight snapshot through serial exports', async () => {
@@ -558,14 +533,12 @@ test('cyclic resourceAttributesVar value does not hang flush (stableKey cycle pr
 
   // Override via resourceAttributesVar forces groupItemsByResource off its
   // no-overrides fast-path and through stableKey.
-  const tagged = action(() => {
-    const cyclic: Record<string, unknown> = { kind: 'experiment-a' }
-    cyclic.self = cyclic
-    resourceAttributesVar.set(cyclic as Record<string, OtlpAttrValue>)
-  }, 'tagged')
+  const cyclic: Record<string, unknown> = { kind: 'experiment-a' }
+  cyclic.self = cyclic
+  const tagged = action(() => undefined, 'tagged')
 
   context.start(() => {
-    tagged()
+    resourceAttributesVar.run(cyclic as Record<string, OtlpAttrValue>, tagged)
   })
 
   await otel.flush()

@@ -223,39 +223,6 @@ test('cancels and beacon handoff have distinct terminal accounting', () => {
   queue.dispose()
 })
 
-test('skipping an intentional non-record releases capacity without a loss', () => {
-  const { queue, sent } = setup({ maxQueueSize: 1, maxBatchSize: 1 })
-  try {
-    const skipped = queue.reserve()!
-    skipped.skip()
-    skipped.skip()
-    skipped.cancel('observation')
-    skipped.commit(0)
-    expect(queue.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 0,
-      dropped: 0,
-      exported: 0,
-    })
-    const next = queue.reserve()!
-    expect(next).toBeDefined()
-    next.commit(1)
-    next.skip()
-    expect(sent.map((lease) => lease.items)).toEqual([[1]])
-    expect(queue.stats().inFlight).toBe(1)
-    success(sent[0]!)
-    expect(queue.stats()).toMatchObject({
-      active: 0,
-      inFlight: 0,
-      exported: 1,
-      dropped: 0,
-    })
-  } finally {
-    queue.dispose()
-  }
-})
-
 test('unload takes only the newest bounded batch, and never steals a busy slot', async () => {
   const { queue, sent, push } = setup({ maxBatchSize: 2 })
   push(0)

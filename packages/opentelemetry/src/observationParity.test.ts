@@ -166,6 +166,7 @@ test.each([false, true])(
       ? reatomOpentelemetry({
           endpoint: 'https://collector.invalid',
           serviceName: 'capture-parity',
+          captureValues: {},
           retry: { maxRetries: 0 },
           fetch: async () => {
             requests++
@@ -175,7 +176,7 @@ test.each([false, true])(
       : undefined
     try {
       run(() => {
-        const source = atom(
+        const source = action(
           () => ({
             get value() {
               return reader()

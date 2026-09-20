@@ -13,7 +13,7 @@ export const createTestWithOTel = (input: {
   const tracing = createWithOTel({
     isActive: input.isActive,
     captureValues: input.captureValues,
-    reserveSpan: () => ({ commit: input.queueSpan, cancel() {}, skip() {} }),
+    reserveSpan: () => ({ commit: input.queueSpan, cancel() {} }),
   })
   onTestFinished(tracing.dispose)
   return tracing.withOTel

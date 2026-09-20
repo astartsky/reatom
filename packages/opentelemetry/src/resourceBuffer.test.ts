@@ -74,14 +74,17 @@ test('metadata-only ambient Buffers retain distinct resource groups after late m
   const run = createRun()
   try {
     const work = run(() =>
-      action((bytes: Uint8Array) => {
-        resourceAttributesVar.set({ bytes })
-        return bytes
-      }, 'resource-buffer.ambient'),
+      action((bytes: Uint8Array) => bytes, 'resource-buffer.ambient'),
     )
 
-    expect(run(() => work(first)) === first).toBe(true)
-    expect(run(() => work(second)) === second).toBe(true)
+    expect(
+      run(() => resourceAttributesVar.run({ bytes: first }, () => work(first))),
+    ).toBe(first)
+    expect(
+      run(() =>
+        resourceAttributesVar.run({ bytes: second }, () => work(second)),
+      ),
+    ).toBe(second)
     first.fill(9)
     second.fill(9)
     await otel.flush()

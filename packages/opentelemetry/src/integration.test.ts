@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { action, atom, computed, context, sleep, wrap } from '@reatom/core'
+import { action, context, sleep, wrap } from '@reatom/core'
 import {
   afterAll,
   afterEach,
@@ -23,7 +23,6 @@ import {
   HEX_TRACE_ID,
   installDomStubs,
   parsePayload,
-  parseSpans,
   withWarnSpy,
 } from './test-helpers.ts'
 
@@ -216,24 +215,6 @@ test('two entry points produce two distinct traces', async () => {
   expect(aSpan.traceId).not.toBe(bSpan.traceId)
   expect(aSpan.parentSpanId).toBeUndefined()
   expect(bSpan.parentSpanId).toBeUndefined()
-})
-
-test('atom transitions ship spans with prev/next state attributes', async () => {
-  const otel = start({ captureValues: {} })
-  const counter = atom(0, 'integration.counter')
-
-  context.start(() => {
-    counter.set(1)
-  })
-  await otel.flush()
-
-  const transition = parseSpans(received[0]!.body).find(
-    (s) =>
-      s.name === 'integration.counter' &&
-      s.attributes.prevState === '0' &&
-      s.attributes.nextState === '1',
-  )
-  expect(transition).toBeDefined()
 })
 
 test('custom headers and resourceAttributes reach the collector', async () => {
@@ -501,15 +482,14 @@ test('resourceAttributesVar overrides merge into the emitted resource attributes
   const otel = start({
     resourceAttributes: { 'deployment.environment': 'dev' },
   })
-  const tagged = action(() => {
-    resourceAttributesVar.set({
-      'deployment.environment': 'staging',
-      'feature.flag': 'experiment-a',
-    })
-  }, 'integration.tagged')
+  const tagged = action(() => undefined, 'integration.tagged')
+  const override = {
+    'deployment.environment': 'staging',
+    'feature.flag': 'experiment-a',
+  }
 
   context.start(() => {
-    tagged()
+    resourceAttributesVar.run(override, tagged)
   })
   await otel.flush()
 
@@ -531,35 +511,37 @@ test('resourceAttributesVar overrides merge into the emitted resource attributes
   })
 })
 
-test('resourceAttributesVar.set() AFTER an awaited wrap is seen by the queued span', async () => {
-  // README documents only that `set()` happens "inside an instrumented
-  // atom/action". A user setting attrs after `await wrap(...)` (e.g. tagging
-  // the span with response headers) is reasonable; verify it is honored.
+test('resourceAttributesVar snapshots an admitted async action before later mutation', async () => {
   const otel = start({
     resourceAttributes: { 'deployment.environment': 'dev' },
   })
+  const gate = Promise.withResolvers<void>()
+  const override = {
+    'http.status': '201',
+    'feature.flag': 'admission',
+  }
   const fetchUser = action(async () => {
-    await wrap(sleep(0))
-    resourceAttributesVar.set({
-      'http.status': '200',
-      'feature.flag': 'post-await',
-    })
+    await wrap(gate.promise)
     return 'ok'
   }, 'integration.post-await-set')
 
-  await context.start(async () => {
-    await fetchUser()
+  const pending = context.start(() => {
+    return resourceAttributesVar.run(override, fetchUser)
   })
+  override['http.status'] = '599'
+  override['feature.flag'] = 'post-await-mutation'
+  gate.resolve()
+  expect(await pending).toBe('ok')
   await otel.flush()
 
   const attrs = resourceAttributesOf(0)
   expect(attrs).toContainEqual({
     key: 'http.status',
-    value: { stringValue: '200' },
+    value: { stringValue: '201' },
   })
   expect(attrs).toContainEqual({
     key: 'feature.flag',
-    value: { stringValue: 'post-await' },
+    value: { stringValue: 'admission' },
   })
 })
 
@@ -567,16 +549,18 @@ test('spans with distinct resourceAttributesVar overrides land in separate resou
   const otel = start({
     resourceAttributes: { 'deployment.environment': 'dev' },
   })
-  const stagingAction = action(() => {
-    resourceAttributesVar.set({ 'deployment.environment': 'staging' })
-  }, 'integration.tag-staging')
-  const prodAction = action(() => {
-    resourceAttributesVar.set({ 'deployment.environment': 'production' })
-  }, 'integration.tag-prod')
+  const stagingAction = action(() => undefined, 'integration.tag-staging')
+  const prodAction = action(() => undefined, 'integration.tag-prod')
 
   context.start(() => {
-    stagingAction()
-    prodAction()
+    resourceAttributesVar.run(
+      { 'deployment.environment': 'staging' },
+      stagingAction,
+    )
+    resourceAttributesVar.run(
+      { 'deployment.environment': 'production' },
+      prodAction,
+    )
   })
   await otel.flush()
 
@@ -613,13 +597,11 @@ test('resourceAttributesVar override does not bleed into the next batch', async 
   const otel = start({
     resourceAttributes: { 'deployment.environment': 'dev' },
   })
-  const tagged = action(() => {
-    resourceAttributesVar.set({ 'deployment.environment': 'staging' })
-  }, 'integration.tagged-leak')
+  const tagged = action(() => undefined, 'integration.tagged-leak')
   const untagged = action(() => 'x', 'integration.untagged-leak')
 
   context.start(() => {
-    tagged()
+    resourceAttributesVar.run({ 'deployment.environment': 'staging' }, tagged)
   })
   await otel.flush()
   context.start(() => {
@@ -648,20 +630,16 @@ test('a dropped span does not leak its resourceAttributesVar override into the b
     maxBatchSize: 1_000,
     batchInterval: 100_000,
   })
-  const accepted = action(() => {
-    resourceAttributesVar.set({ 'feature.flag': 'kept' })
-  }, 'integration.accepted')
-  const overflowed = action(() => {
-    resourceAttributesVar.set({ 'feature.flag': 'leaked' })
-  }, 'integration.overflowed')
+  const accepted = action(() => undefined, 'integration.accepted')
+  const overflowed = action(() => undefined, 'integration.overflowed')
 
   context.start(() => {
-    accepted()
+    resourceAttributesVar.run({ 'feature.flag': 'kept' }, accepted)
   })
   // maxQueueSize is already saturated; this span's override must NOT
   // attach to the batch made of the previously-accepted span.
   context.start(() => {
-    overflowed()
+    resourceAttributesVar.run({ 'feature.flag': 'leaked' }, overflowed)
   })
   await otel.flush()
 
@@ -694,59 +672,6 @@ test('drop-newest backpressure caps the queue at maxQueueSize', async () => {
     (s) => s.name === 'integration.burst',
   )
   expect(burstSpans.length).toBeLessThanOrEqual(5)
-})
-
-test('deep mixed chain: action -> atom.set -> computed atom -> nested action shares one trace and stitches parent/child correctly', async () => {
-  const otel = start()
-  const counter = atom(0, 'chain.counter')
-  const doubled = computed(() => counter() * 2, 'chain.doubled')
-  const log = action((n: number) => `value=${n}`, 'chain.log')
-  const trigger = action(() => {
-    counter.set(5)
-    log(doubled())
-  }, 'chain.trigger')
-
-  context.start(() => {
-    trigger()
-  })
-  await otel.flush()
-
-  expect(received).toHaveLength(1)
-  const parsed = parsePayload(received[0]!.body)
-  const spans = parsed.resourceSpans.flatMap((rs) => rs.spans)
-  const findByName = (name: string): ParsedSpan => {
-    const matches = spans.filter((s) => s.name === name)
-    if (matches.length !== 1) {
-      throw new Error(
-        `expected exactly 1 span named "${name}", got ${matches.length}`,
-      )
-    }
-    return matches[0]!
-  }
-
-  // Single entry point => single trace.
-  const traceIds = new Set(spans.map((s) => s.traceId))
-  expect(traceIds.size).toBe(1)
-
-  // Trigger is the unique root of the trace.
-  const trig = findByName('chain.trigger')
-  expect(trig.parentSpanId).toBeUndefined()
-
-  // Every other span must descend from trigger (directly or transitively).
-  const byId = new Map(spans.map((s) => [s.spanId, s]))
-  const ancestorsOf = (s: ParsedSpan): string[] => {
-    const out: string[] = []
-    let cur: ParsedSpan | undefined = s
-    while (cur?.parentSpanId) {
-      out.push(cur.parentSpanId)
-      cur = byId.get(cur.parentSpanId)
-    }
-    return out
-  }
-  for (const s of spans) {
-    if (s.spanId === trig.spanId) continue
-    expect(ancestorsOf(s)).toContain(trig.spanId)
-  }
 })
 
 test('a failing nested action emits an error span and exception event without poisoning siblings', async () => {

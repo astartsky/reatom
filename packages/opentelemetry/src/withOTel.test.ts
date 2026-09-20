@@ -1,11 +1,4 @@
-import {
-  action,
-  actionMiddleware,
-  atom,
-  context,
-  sleep,
-  wrap,
-} from '@reatom/core'
+import { action, actionMiddleware, context, sleep, wrap } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
@@ -300,28 +293,6 @@ test('non-Error throw still records exception event with sane defaults', async (
   expect(Object.hasOwn(event.attributes!, 'exception.escaped')).toBe(false)
 })
 
-test('atom records a span with prev/next state on setter call', () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({
-    queueSpan,
-    isActive: () => true,
-    captureValues: {},
-  })
-
-  const counter = atom(0, 'counter').extend(withOTel())
-
-  context.start(() => {
-    counter.set(1)
-  })
-
-  expect(spans.length).toBeGreaterThanOrEqual(1)
-  const transition = spans.find(
-    (s) => s.attributes?.prevState === '0' && s.attributes?.nextState === '1',
-  )
-  expect(transition).toBeDefined()
-  expect(transition!.name).toBe('counter')
-})
-
 test('bare sibling actions in the same context.start get distinct traces', () => {
   const { spans, queueSpan } = collectSpans()
   const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
@@ -396,24 +367,6 @@ test('two concurrent async invocations of the same action get distinct root trac
   expect(spans[1]!.parentSpanId).toBeUndefined()
 })
 
-test('repeated set on the same atom gets distinct root traces', () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-
-  const counter = atom(0, 'counter').extend(withOTel())
-
-  context.start(() => {
-    counter.set(1)
-    counter.set(2)
-  })
-
-  const transitions = spans.filter((s) => s.name === 'counter')
-  expect(transitions.length).toBeGreaterThanOrEqual(2)
-  const traces = new Set(transitions.map((s) => s.traceId))
-  expect(traces.size).toBe(transitions.length)
-  for (const s of transitions) expect(s.parentSpanId).toBeUndefined()
-})
-
 test('an async action followed by a sync sibling does not adopt the async one as parent', async () => {
   const { spans, queueSpan } = collectSpans()
   const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
@@ -431,30 +384,6 @@ test('an async action followed by a sync sibling does not adopt the async one as
   const b = spans.find((s) => s.name === 'syncB')!
   expect(a.traceId).not.toBe(b.traceId)
   expect(b.parentSpanId).toBeUndefined()
-})
-
-// Codifies that `wrap()` preserves the reactive frame across `await`, so a
-// child action invoked AFTER the await still sees the parent's execution context
-// and inherits the trace. A future change to @reatom/core's frame
-// propagation that breaks this would silently fragment async traces.
-test('child action invoked after `await wrap(...)` inherits the parent trace', async () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-
-  const child = action(() => 'c', 'child').extend(withOTel())
-  const parent = action(async () => {
-    await wrap(sleep(0))
-    child()
-    return 'p'
-  }, 'parent').extend(withOTel())
-
-  await context.start(() => parent())
-
-  expect(spans).toHaveLength(2)
-  const parentSpan = spans.find((s) => s.name === 'parent')!
-  const childSpan = spans.find((s) => s.name === 'child')!
-  expect(childSpan.traceId).toBe(parentSpan.traceId)
-  expect(childSpan.parentSpanId).toBe(parentSpan.spanId)
 })
 
 // OTel mandate: a tracer must never escalate. If queueSpan or serialize
