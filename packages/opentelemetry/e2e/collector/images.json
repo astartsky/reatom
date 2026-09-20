@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "platform": "linux/arm64",
+  "collector": {
+    "version": "0.161.0",
+    "repository": "otel/opentelemetry-collector-contrib",
+    "tag": "0.161.0",
+    "user": "10001:10001",
+    "source": "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.161.0",
+    "indexDigest": "sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
+    "manifestDigest": "sha256:d497a11a3088097e4054ffbfd4b4f5244a8c036dc77c96cf2f14f86113ee9b86",
+    "image": "otel/opentelemetry-collector-contrib:0.161.0@sha256:d497a11a3088097e4054ffbfd4b4f5244a8c036dc77c96cf2f14f86113ee9b86"
+  },
+  "playwright": {
+    "version": "1.60.0",
+    "repository": "mcr.microsoft.com/playwright",
+    "tag": "v1.60.0-noble",
+    "source": "https://github.com/microsoft/playwright/blob/v1.60.0/utils/docker/Dockerfile.noble",
+    "indexDigest": "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948",
+    "manifestDigest": "sha256:beddddcf96f19abec078cd2f3da676f40abd460e0e734ad5eed73627ce161d33",
+    "image": "mcr.microsoft.com/playwright:v1.60.0-noble@sha256:beddddcf96f19abec078cd2f3da676f40abd460e0e734ad5eed73627ce161d33"
+  },
+  "runner": {
+    "repository": "reatom-otel-collector-runner",
+    "package": {
+      "name": "reatom-collector-runner",
+      "version": "1.0.0",
+      "private": true,
+      "dependencies": {
+        "playwright": "1.60.0"
+      }
+    },
+    "lock": {
+      "name": "reatom-collector-runner",
+      "version": "1.0.0",
+      "lockfileVersion": 3,
+      "requires": true,
+      "packages": {
+        "": {
+          "name": "reatom-collector-runner",
+          "version": "1.0.0",
+          "dependencies": {
+            "playwright": "1.60.0"
+          }
+        },
+        "node_modules/fsevents": {
+          "version": "2.3.2",
+          "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
+          "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
+          "hasInstallScript": true,
+          "license": "MIT",
+          "optional": true,
+          "os": ["darwin"],
+          "engines": {
+            "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+          }
+        },
+        "node_modules/playwright": {
+          "version": "1.60.0",
+          "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.60.0.tgz",
+          "integrity": "sha512-hheHdokM8cdqCb0lcE3s+zT4t4W+vvjpGxsZlDnikarzx8tSzMebh3UiFtgqwFwnTnjYQcsyMF8ei2mCO/tpeA==",
+          "license": "Apache-2.0",
+          "dependencies": {
+            "playwright-core": "1.60.0"
+          },
+          "bin": {
+            "playwright": "cli.js"
+          },
+          "engines": {
+            "node": ">=18"
+          },
+          "optionalDependencies": {
+            "fsevents": "2.3.2"
+          }
+        },
+        "node_modules/playwright-core": {
+          "version": "1.60.0",
+          "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.60.0.tgz",
+          "integrity": "sha512-9bW6zvX/m0lEbgTKJ6YppOKx8H3VOPBMOCFh2irXFOT4BbHgrx5hPjwJYLT40Lu+4qtD36qKc/Hn56StUW57IA==",
+          "license": "Apache-2.0",
+          "bin": {
+            "playwright-core": "cli.js"
+          },
+          "engines": {
+            "node": ">=18"
+          }
+        }
+      }
+    }
+  }
+}

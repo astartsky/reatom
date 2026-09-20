@@ -1,0 +1,66 @@
+services:
+  collector:
+    image: ${COLLECTOR_IMAGE:?Run the host run.mjs script}
+    platform: linux/arm64
+    pull_policy: never
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - type: bind
+        source: ./collector.yaml
+        target: /etc/otelcol-contrib/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COLLECTOR_ARTIFACTS:?Fresh artifacts directory required}
+        target: /artifacts
+        bind:
+          create_host_path: false
+    networks: [collector_e2e]
+  runner:
+    image: ${COLLECTOR_RUNNER_IMAGE:?Run prepare-images.mjs first}
+    platform: linux/arm64
+    pull_policy: never
+    user: '10001:10001'
+    init: true
+    working_dir: /suite
+    read_only: true
+    shm_size: 1gb
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+    environment:
+      COLLECTOR_ARTIFACTS: /artifacts
+      COLLECTOR_APPS: /apps
+      COLLECTOR_RUN_ID: ${COLLECTOR_RUN_ID:?Unique run ID required}
+      COLLECTOR_CASE: ${COLLECTOR_CASE:-}
+      HOME: /tmp
+    volumes:
+      - type: bind
+        source: .
+        target: /suite
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COLLECTOR_APPS:?Prepared apps directory required}
+        target: /apps
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COLLECTOR_ARTIFACTS:?Fresh artifacts directory required}
+        target: /artifacts
+        bind:
+          create_host_path: false
+    networks:
+      collector_e2e:
+        aliases: [runner]
+networks:
+  collector_e2e:
+    internal: true

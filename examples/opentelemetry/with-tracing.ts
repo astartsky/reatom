@@ -1,4 +1,4 @@
-import { action, atom, computed } from '@reatom/core'
+import { action, atom, computed, wrap } from '@reatom/core'
 import {
   reatomOpentelemetry,
   type ReatomOpentelemetryInput,
@@ -13,6 +13,11 @@ export const createTracedCounter = (options: ReatomOpentelemetryInput) => {
     () => count.set((value) => value + 1),
     'example.increment',
   )
+  const incrementAfter = action(async (wait: Promise<void>) => {
+    const parent = otel.getCurrentContext()
+    await wrap(wait)
+    return otel.withContext(parent, increment)
+  }, 'example.incrementAfter')
 
   return {
     count,
@@ -23,6 +28,8 @@ export const createTracedCounter = (options: ReatomOpentelemetryInput) => {
         doubled: doubled(),
         context: otel.getCurrentContext(),
       })),
+    updateAfter: (wait: Promise<void>) =>
+      otel.startTrace('example.updateAfter', () => incrementAfter(wait)),
     flush: otel.flush,
     dispose: otel.dispose,
   }

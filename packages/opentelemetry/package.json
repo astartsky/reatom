@@ -21,7 +21,9 @@
     "build": "tsdown",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:browser": "vitest run --config vitest.browser.config.ts"
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "test:e2e:collector": "node e2e/collector/run.mjs",
+    "test:e2e:collector:oracle": "node --test e2e/collector/oracle.test.mjs e2e/collector/netlog.test.mjs"
   },
   "tsdown": {
     "format": [

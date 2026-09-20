@@ -1,0 +1,23 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins: [http://runner:4173]
+          allowed_headers: [Content-Type]
+exporters:
+  file:
+    path: /artifacts/collector/traces.jsonl
+    format: json
+    append: false
+    flush_interval: 100ms
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]
