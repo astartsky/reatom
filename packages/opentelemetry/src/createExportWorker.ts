@@ -9,10 +9,13 @@ export interface ExportState {
   signal: AbortSignal
   deadline: number
   keepalive: boolean
+  /** Report selection before IO; these records stay leased until settlement. */
+  excludeOversized(count: number): void
 }
 
 export interface ExportWorkerInput<T> {
   exportTimeoutMs: number
+  /** Returns the outcome of the records remaining after excludeOversized. */
   send(items: readonly T[], state: ExportState): Promise<BatchOutcome>
   onError?: (error: unknown, items: readonly T[]) => void
   onQuarantine?: (count: number) => void
@@ -26,7 +29,9 @@ const dropped = (reason: DropReason, count: number): BatchOutcome => ({
 const report = (callback: () => void) => {
   try {
     callback()
-  } catch {}
+  } catch {
+    // Diagnostics must not interrupt lease settlement.
+  }
 }
 
 /** A deadline requests abort; only transport settlement releases the lease. */
@@ -45,6 +50,15 @@ export const createExportWorker = <T>(input: ExportWorkerInput<T>) => {
       if (current) throw new Error('OTLP transport slot is already occupied')
       const controller = new AbortController()
       const deadline = Date.now() + input.exportTimeoutMs
+      let excluded = 0
+      const failedOutcome = (reason: DropReason): BatchOutcome => ({
+        exported: 0,
+        beaconAccepted: 0,
+        droppedByReason: {
+          [reason]: lease.items.length - excluded,
+          ...(excluded ? { oversized: excluded } : {}),
+        },
+      })
       let terminal: 'timeout' | 'disposed' | undefined
       let quarantineTimer: ReturnType<typeof setTimeout> | undefined
       const state = {
@@ -79,7 +93,24 @@ export const createExportWorker = <T>(input: ExportWorkerInput<T>) => {
             signal: controller.signal,
             deadline,
             keepalive,
+            excludeOversized(count) {
+              if (
+                !Number.isSafeInteger(count) ||
+                count < 0 ||
+                count > lease.items.length
+              )
+                throw new RangeError('Invalid excluded record count')
+              excluded = count
+            },
           })
+          if (excluded)
+            outcome = {
+              ...outcome,
+              droppedByReason: {
+                ...outcome.droppedByReason,
+                oversized: (outcome.droppedByReason.oversized ?? 0) + excluded,
+              },
+            }
         } catch (error) {
           failure = error
           failed = true
@@ -87,18 +118,18 @@ export const createExportWorker = <T>(input: ExportWorkerInput<T>) => {
           report(() => {
             if (error instanceof ExportTimeoutError) reason = 'timeout'
           })
-          outcome = dropped(reason, lease.items.length)
+          outcome = failedOutcome(reason)
         }
         clearTimeout(timer)
         if (quarantineTimer !== undefined) clearTimeout(quarantineTimer)
         current = undefined
-        if (terminal) outcome = dropped(terminal, lease.items.length)
+        if (terminal) outcome = failedOutcome(terminal)
         try {
           lease.release(outcome)
         } catch (error) {
           failure = error
           failed = true
-          lease.release(dropped('export', lease.items.length))
+          lease.release(failedOutcome('export'))
         }
         if (failed && terminal !== 'disposed')
           report(() => input.onError?.(failure, lease.items))

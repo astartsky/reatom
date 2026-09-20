@@ -18,11 +18,25 @@ const base = {
 }
 
 test('suspension and hostile-error observation free capacity; later work exports one span', async () => {
-  const fetchMock = vi.fn(
-    async (_url: unknown, _init?: RequestInit) =>
-      new Response(null, { status: 200 }),
+  const fetchMock = vi.fn<typeof globalThis.fetch>(
+    async () => new Response(null, { status: 200 }),
   )
-  const otel = reatomOpentelemetry({ ...base, fetch: fetchMock })
+  let failingCaptures = 0
+  let liveCaptures = 0
+  const otel = reatomOpentelemetry({
+    ...base,
+    fetch: fetchMock,
+    captureValues: {
+      redact(key: string, value: unknown) {
+        if (key === 'exception.message' && value === 'application failure') {
+          failingCaptures++
+          throw new Error('observer failure')
+        }
+        if (key === 'payload' && value === 'ok') liveCaptures++
+        return value
+      },
+    },
+  })
   try {
     const suspense = Promise.resolve('suspense')
     let suspendingCalls = 0
@@ -50,11 +64,6 @@ test('suspension and hostile-error observation free capacity; later work exports
     })
 
     const original = new Error('application failure')
-    Object.defineProperty(original, 'constructor', {
-      get() {
-        throw new Error('observer failure')
-      },
-    })
     let failingCalls = 0
     const failing = computed(() => {
       failingCalls++
@@ -70,6 +79,8 @@ test('suspension and hostile-error observation free capacity; later work exports
       expect(caught === original).toBe(true)
       expect(failingCalls).toBe(1)
     })
+    expect(failingCaptures).toBe(1)
+    expect(liveCaptures).toBe(0)
     expect(otel.stats()).toMatchObject({
       active: 0,
       queued: 0,
@@ -82,6 +93,8 @@ test('suspension and hostile-error observation free capacity; later work exports
     context.start(() => {
       expect(ordinary()).toBe('ok')
     })
+    expect(liveCaptures).toBe(1)
+    expect(failingCaptures).toBe(1)
     await otel.flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const payload = JSON.parse(

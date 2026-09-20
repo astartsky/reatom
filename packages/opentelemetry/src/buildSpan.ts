@@ -29,6 +29,7 @@ export interface SpanInput {
   startTimeMs: number
   endTimeMs: number
   attributes?: Record<string, OtlpAttrValue>
+  links?: ReadonlyArray<{ traceId: TraceId; spanId: SpanId }>
   events?: SpanEventInput[]
   status?: { code: StatusCode; message?: string }
 }
@@ -44,6 +45,7 @@ export interface OtlpSpan {
   startTimeUnixNano: string
   endTimeUnixNano: string
   attributes: ReturnType<typeof toOtlpAttributes>
+  links?: SpanInput['links']
   events: OtlpSpanEvent[]
   status?: OtlpSpanStatus
 }
@@ -60,6 +62,8 @@ export const buildSpan = (input: SpanInput): OtlpSpan => {
     events: input.events?.map(buildSpanEvent) ?? [],
   }
   if (input.parentSpanId) span.parentSpanId = input.parentSpanId
+  if (input.links?.length)
+    span.links = input.links.map(({ traceId, spanId }) => ({ traceId, spanId }))
   if (input.status)
     span.status = buildSpanStatus(input.status.code, input.status.message)
   return span

@@ -39,7 +39,7 @@ const setup = (
 }
 
 test('flushed batch posts OTLP/JSON payload to /v1/traces with service.name attribute', async () => {
-  const { otel, fetchMock } = setup()
+  const { otel, fetchMock } = setup({ captureValues: {} })
 
   const greet = action(() => 'hello', 'greet').extend(otel.withOTel())
 
@@ -168,7 +168,7 @@ test('dispose unregisters auto-instrumentation so subsequent atoms emit no spans
 // first global-ext run, so the timing-tolerant signal is the action's
 // middleware shape.
 test('auto-instrumented action emits params/payload, not prevState/nextState', async () => {
-  const { otel, fetchMock } = setup()
+  const { otel, fetchMock } = setup({ captureValues: {} })
 
   const greet = action((name: string) => `hi ${name}`, 'greet')
 
@@ -189,7 +189,7 @@ test('auto-instrumented action emits params/payload, not prevState/nextState', a
 })
 
 test('auto-instrumented async action emits one span on resolve, not at synchronous return', async () => {
-  const { otel, fetchMock } = setup()
+  const { otel, fetchMock } = setup({ captureValues: {} })
 
   const fetchData = action(async () => {
     await Promise.resolve()
@@ -208,7 +208,7 @@ test('auto-instrumented async action emits one span on resolve, not at synchrono
 })
 
 test('auto-instrumented atom still emits prevState/nextState', async () => {
-  const { otel, fetchMock } = setup()
+  const { otel, fetchMock } = setup({ captureValues: {} })
 
   const counter = atom(0, 'counter')
 
@@ -255,8 +255,9 @@ test('flush() waits for its queued and in-flight snapshot through serial exports
     a()
     b()
   })
-  expect(fetchMock).toHaveBeenCalledTimes(1)
   expect(otel.stats()).toMatchObject({ queued: 1, inFlight: 1 })
+  await Promise.resolve()
+  expect(fetchMock).toHaveBeenCalledTimes(1)
   let flushSettled = false
   const flush = otel.flush().then(() => {
     flushSettled = true
@@ -392,10 +393,8 @@ test('dispose() does not log abort warnings', async () => {
   }
 })
 
-// `application/json` payloads trigger a CORS preflight in sendBeacon, which
-// the browser CANNOT perform during unload — so the default unload transport
-// must be `fetch({ keepalive: true })`, not navigator.sendBeacon. Beacon stays
-// available behind explicit `useBeacon: true` for same-origin collectors.
+// Authenticated collectors need fetch because beacon cannot carry headers.
+// The default remains keepalive fetch; beacon requires an explicit opt-in.
 test('default unload transport is keepalive fetch — sendBeacon is NOT called when useBeacon is unspecified', async () => {
   const { windowListeners, restore } = installDomStubs()
   try {

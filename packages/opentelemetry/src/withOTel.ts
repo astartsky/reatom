@@ -1,33 +1,32 @@
-import type { AtomLike, Fn, GenericExt } from '@reatom/core'
-import {
-  bind,
-  isAbort,
-  isAction,
-  STACK,
-  top,
-  withActionMiddleware,
-  withMiddleware,
-} from '@reatom/core'
+import type { AtomLike, AtomMeta, Fn, GenericExt } from '@reatom/core'
+import { bind, isAction, STACK, withActionMiddleware } from '@reatom/core'
 
 import type { SpanInput, SpanKind } from './buildSpan.ts'
 import type { SpanEventInput } from './buildSpanEvent.ts'
+import {
+  type CaptureValuesOptions,
+  createValueCapture,
+} from './captureValues.ts'
+import { createLinkCollector, type LinkExecution } from './collectLinks.ts'
 import type { Reservation } from './createBatchQueue.ts'
-import type { SpanId } from './generateSpanId.ts'
-import { generateSpanId } from './generateSpanId.ts'
-import type { TraceId } from './generateTraceId.ts'
-import { generateTraceId } from './generateTraceId.ts'
+import { errorData, exceptionType } from './errorMetadata.ts'
 import { observe } from './observation.ts'
-import { serialize } from './serialize.ts'
-import { spanIdVar } from './spanIdVar.ts'
+import {
+  createChildContext,
+  createSpanContext,
+  isOTelInternal,
+  ROOT_BOUNDARY,
+} from './spanContext.ts'
+import { toOtlpBytesValue } from './toOtlpBytesValue.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
-import { traceIdVar } from './traceIdVar.ts'
 
 export interface WithOTelOptions {
   kind?: SpanKind
 }
 
 export interface CreateWithOTelInput {
-  /** Admission precedes IDs, context writes and inspection of user values. */
+  captureValues?: CaptureValuesOptions
+  /** Admission precedes IDs/capture; rejected invocations still carry context. */
   reserveSpan: () => Reservation<SpanInput> | undefined
   /**
    * Checked before starting observation and at completion, before inspecting
@@ -36,214 +35,321 @@ export interface CreateWithOTelInput {
   isActive: () => boolean
 }
 
-interface SpanContext {
-  traceId: TraceId
-  parentTraceId: TraceId | undefined
-  spanId: SpanId
-  parentSpanId: SpanId | undefined
-}
+// Only owned, normalized snapshots reach JSON.stringify.
+const stringifyCaptured = (value: OtlpAttrValue): string =>
+  typeof value === 'string'
+    ? value
+    : JSON.stringify(value, (_, item) =>
+        typeof item === 'bigint'
+          ? String(item)
+          : item instanceof Uint8Array
+            ? toOtlpBytesValue(item).bytesValue
+            : item,
+      )
 
-// Read trace context from the caller frame on the JS stack — top()'s
-// pubs[0] is null on atom-set / computed-read paths when OTel runs (the
-// caller link is wired later by computedMiddleware on the write branch
-// only, or by cacheMiddleware on read AFTER next()). Action middleware
-// hand-rolls pubs[0] before OTel runs, which is why action -> action
-// inheritance worked under the old top()-based read.
-const enterSpan = (): SpanContext => {
-  const callerFrame = STACK[STACK.length - 2]
-  const parentTraceId = callerFrame ? traceIdVar.get(callerFrame) : undefined
-  const traceId = parentTraceId ?? generateTraceId()
-  const parentSpanId =
-    parentTraceId && callerFrame ? spanIdVar.get(callerFrame) : undefined
-  const spanId = generateSpanId()
-  return { traceId, parentTraceId, spanId, parentSpanId }
-}
+type ExecutionObserver =
+  NonNullable<AtomMeta['_executionObservers']> extends Set<infer T> ? T : never
+type Outcome = Parameters<Extract<ReturnType<ExecutionObserver>, Fn>>[0]
 
-// Reatom abort and thrown-Promise (suspension) are control flow, not errors:
-// they get an ok-status span with a payload note instead of an error span.
-const isControlFlow = (error: unknown): boolean =>
-  isAbort(error) || error instanceof Promise
-
-const controlFlowAttributes = (
-  error: unknown,
-): Record<string, string> | undefined => {
-  if (isAbort(error)) return { payload: serialize(error) }
-  if (error instanceof Promise) return { payload: '[Suspension]' }
-  return undefined
-}
-
-// Per OTel semantic conventions for exceptions: an error span carries a span
-// event named "exception" with exception.type / .message / .stacktrace /
-// .escaped. Auto-instrumentation always rethrows, so `escaped` is always true.
-// https://opentelemetry.io/docs/specs/semconv/exceptions/exception-spans/
-const exceptionEvent = (error: unknown, timeMs: number): SpanEventInput => {
-  const isErr = error instanceof Error
-  const attributes: Record<string, OtlpAttrValue> = {
-    'exception.type': isErr ? error.constructor.name : 'Error',
-    'exception.message': isErr ? error.message : serialize(error),
-    'exception.escaped': true,
-  }
-  if (isErr && error.stack) attributes['exception.stacktrace'] = error.stack
-  return { name: 'exception', timeMs, attributes }
-}
-
-/**
- * Idempotent: applying twice to the same target merges options (later override
- * wins) but installs the middleware only once, so a global
- * `addGlobalExtension(withOTel())` plus a local `withOTel({ kind })` override
- * doesn't double-emit.
- */
+/** One admission/completion implementation serves actions and atom executions. */
 export const createWithOTel = ({
   reserveSpan,
   isActive,
+  captureValues = false,
 }: CreateWithOTelInput) => {
-  const optionsByTarget = new WeakMap<AtomLike, WithOTelOptions>()
-  const installed = new WeakSet<AtomLike>()
+  const storage = createSpanContext()
+  const links = createLinkCollector()
+  const optionsByTarget = new WeakMap<
+    AtomLike,
+    WithOTelOptions & { enabled: boolean }
+  >()
 
-  return (options: WithOTelOptions = {}): GenericExt<AtomLike> => {
-    return ((target: AtomLike): AtomLike => {
-      let opts = optionsByTarget.get(target)
-      if (opts) Object.assign(opts, options)
-      else optionsByTarget.set(target, (opts = { ...options }))
-
-      if (installed.has(target)) return target
-
-      installed.add(target)
-
-      // Per OTel API spec, STATUS_CODE_OK SHOULD only be set by the
-      // application — instrumentation leaves success spans unset so a user's
-      // explicit `setStatus(OK)` retains its signal. Errors and explicit
-      // failures emit `error`; AbortError/Suspension are control flow and
-      // route through `emitErr`'s `cf` branch (status unset, payload note).
-      const startMiddleware = (queueSpan: (span: SpanInput) => void) => {
-        // Anchor wall clock once and measure duration via a monotonic source
-        // so NTP steps cannot produce negative endTime - startTime.
-        const startTimeMs = Date.now()
-        const startPerfMs = performance.now()
-        const ctx = enterSpan()
-
-        spanIdVar.set(ctx.spanId)
-        if (!ctx.parentTraceId) traceIdVar.set(ctx.traceId)
-
-        // Derived from the same monotonic anchor as endTimeMs so an event
-        // timestamp can never sit outside [startTimeMs, endTimeMs] — which a
-        // raw Date.now() would do under an NTP step.
-        const nowMs = () => startTimeMs + (performance.now() - startPerfMs)
-
-        const queueWith = (
-          attributes: SpanInput['attributes'],
-          status?: SpanInput['status'],
-          events?: SpanInput['events'],
-        ) =>
-          queueSpan({
-            traceId: ctx.traceId,
-            spanId: ctx.spanId,
-            parentSpanId: ctx.parentSpanId,
-            name: target.name,
-            kind: opts.kind,
-            startTimeMs,
-            endTimeMs: nowMs(),
-            attributes,
-            status,
-            events,
+  const observeSpan = (
+    name: string,
+    options: WithOTelOptions & { enabled: boolean },
+    actionTarget: boolean,
+    params: readonly unknown[],
+    previousState: unknown,
+    root = false,
+    execution?: LinkExecution,
+  ): ((outcome: Outcome) => void) | undefined => {
+    if (!isActive()) return
+    const reservation = options.enabled ? observe(reserveSpan) : undefined
+    const parent = observe(() => {
+      const value = root
+        ? ROOT_BOUNDARY
+        : (storage.read(STACK.length - 2) ?? ROOT_BOUNDARY)
+      // Even rejected/filtered invocations carry the parent or an explicit
+      // boundary through wrap(), without creating a nonexistent span parent.
+      storage.write(value)
+      return value
+    })
+    if (!reservation) return
+    if (name.length > 16_384) {
+      observe(() => reservation.cancel('oversized'))
+      return
+    }
+    const span = observe(() => {
+      const startTimeMs = Date.now()
+      const startPerfMs = performance.now()
+      const capture = captureValues
+        ? createValueCapture(captureValues.redact)
+        : undefined
+      const captured = (key: string, value: unknown) =>
+        stringifyCaptured(capture!.capture(key, value))
+      const before: SpanInput['attributes'] = capture
+        ? actionTarget
+          ? { params: captured('params', params) }
+          : { prevState: captured('prevState', previousState) }
+        : undefined
+      // Redaction can dispose this adapter while the input is being captured.
+      if (!isActive()) return
+      const ctx = createChildContext(parent)
+      storage.write(ctx)
+      if (execution) execution.context = ctx
+      const nowMs = () => startTimeMs + (performance.now() - startPerfMs)
+      const queueWith = (
+        attributes: SpanInput['attributes'],
+        status?: SpanInput['status'],
+        events?: SpanInput['events'],
+      ) =>
+        reservation.commit({
+          ...ctx,
+          parentSpanId:
+            parent && parent !== ROOT_BOUNDARY ? parent.spanId : undefined,
+          name,
+          kind: options.kind,
+          startTimeMs,
+          endTimeMs: nowMs(),
+          attributes,
+          status,
+          events,
+          links: execution?.links,
+        })
+      const queueErr = (error: unknown) => {
+        const attributes: Record<string, OtlpAttrValue> = {
+          'exception.type': exceptionType(error),
+        }
+        let message: string | undefined
+        if (capture) {
+          const value =
+            error instanceof Error ? errorData(error, 'message') : error
+          if (value !== undefined)
+            attributes['exception.message'] = message = captured(
+              'exception.message',
+              value,
+            )
+          const stack = errorData(error, 'stack')
+          if (stack !== undefined)
+            attributes['exception.stacktrace'] = captured(
+              'exception.stacktrace',
+              stack,
+            )
+        }
+        const event: SpanEventInput = {
+          name: 'exception',
+          timeMs: nowMs(),
+          attributes,
+        }
+        queueWith(
+          before,
+          { code: 'error', ...(message === undefined ? {} : { message }) },
+          [event],
+        )
+      }
+      const emitErr = (error: unknown) => {
+        if (error instanceof Promise) queueWith({ payload: '[Suspension]' })
+        else if (exceptionType(error) === 'AbortError') {
+          const reason = capture ? errorData(error, 'message') : undefined
+          queueWith({
+            payload:
+              reason === undefined
+                ? '[AbortError]'
+                : captured('payload', reason),
           })
-
-        const queueErr = (error: unknown) =>
-          queueWith(undefined, { code: 'error', message: serialize(error) }, [
-            exceptionEvent(error, nowMs()),
-          ])
-
-        const emitErr = (error: unknown) => {
-          if (isControlFlow(error)) {
-            queueWith(controlFlowAttributes(error))
-            return
-          }
-          queueErr(error)
-        }
-
-        return { queueWith, queueErr, emitErr }
+        } else queueErr(error)
       }
-
-      const actionTarget = isAction(target)
-      const middleware =
-        () =>
-        (next: Fn, ...params: any[]) => {
-          if (!isActive()) return next(...params)
-
-          const reservation = observe(reserveSpan)
-          if (!reservation) return next(...params)
-          const span = observe(() => startMiddleware(reservation.commit))
-          if (!span) {
-            observe(() => reservation.cancel('observation'))
-            return next(...params)
-          }
-          const prevState = actionTarget ? undefined : top().state
-          let completed = false
-          const complete = (callback: () => void) => {
-            if (completed) return
-            completed = true
-            observe(() => {
-              if (!isActive()) {
-                reservation.cancel('disposed')
-                return
+      const success = (value: unknown) =>
+        queueWith(
+          capture
+            ? {
+                ...before,
+                [actionTarget ? 'payload' : 'nextState']: captured(
+                  actionTarget ? 'payload' : 'nextState',
+                  value,
+                ),
               }
-              try {
-                callback()
-              } finally {
-                // No-op after commit/skip; releases failures during observation.
-                reservation.cancel('observation')
-              }
-            })
-          }
-          const success = (value: unknown) =>
-            complete(() => {
-              span.queueWith(
-                actionTarget
-                  ? { params: serialize(params), payload: serialize(value) }
-                  : {
-                      prevState: serialize(prevState),
-                      nextState: serialize(value),
-                    },
-              )
-            })
-          const failure = (error: unknown, async: boolean) =>
-            complete(() => {
-              if (!actionTarget && !async) {
-                // Preserve atom-set error semantics and suspension control flow.
-                if (error instanceof Promise) reservation.skip()
-                else span.queueErr(error)
-              } else span.emitErr(error)
-            })
-
-          let result
-          try {
-            result = next(...params)
-          } catch (error) {
-            failure(error, false)
-            throw error
-          }
-
-          if (isActive()) {
-            const attached = observe(() => {
-              if (result instanceof Promise) {
-                result
-                  .then(
-                    bind(success),
-                    bind((error: unknown) => failure(error, true)),
-                  )
-                  .catch(() => {})
-              } else success(result)
-              return true
-            })
-            if (!attached) complete(() => {})
-          } else observe(() => reservation.cancel('disposed'))
-          return result
+            : undefined,
+        )
+      return { success, queueErr, emitErr }
+    })
+    if (!span) {
+      observe(() => reservation.cancel('observation'))
+      return
+    }
+    let completed = false
+    const complete = (callback: () => void) => {
+      if (completed) return
+      completed = true
+      observe(() => {
+        if (!isActive()) {
+          reservation.cancel('disposed')
+          return
         }
-
-      if (isAction(target)) {
-        return target.extend(withActionMiddleware(middleware))
+        try {
+          callback()
+        } finally {
+          reservation.cancel('observation')
+        }
+      })
+    }
+    const success = (value: unknown) =>
+      complete(() => {
+        span.success(value)
+      })
+    const failure = (error: unknown, async: boolean) =>
+      complete(() => {
+        if (!actionTarget && !async) {
+          if (error instanceof Promise) reservation.skip()
+          else span.queueErr(error)
+        } else span.emitErr(error)
+      })
+    return (outcome) => {
+      if (!outcome.ok) {
+        failure(outcome.error, false)
+        return
       }
-      return target.extend(withMiddleware(middleware))
-    }) as GenericExt<AtomLike>
+      if (!isActive()) {
+        complete(() => {})
+        return
+      }
+      const attached = observe(() => {
+        const result = outcome.value
+        if (result instanceof Promise) {
+          result
+            .then(
+              bind(success),
+              bind((error: unknown) => failure(error, true)),
+            )
+            .catch(() => {})
+        } else success(result)
+        return true
+      })
+      // A hostile .then can register a callback and then throw. Close the
+      // finalizer so that a later callback cannot inspect a dropped result.
+      if (!attached) complete(() => {})
+    }
+  }
+
+  // Each execution overlays a complete context only for its synchronous body.
+  // Continuations keep their captured record; later executions of this frame
+  // must not inherit a completed execution's context (including other adapters).
+  const begin = (...args: Parameters<typeof observeSpan>) => {
+    if (!isActive()) return
+    const restore = storage.save()
+    let finish: ReturnType<typeof observeSpan>
+    try {
+      finish = observeSpan(...args)
+    } catch (error) {
+      restore()
+      throw error
+    }
+    return (outcome: Outcome) => {
+      try {
+        finish?.(outcome)
+      } finally {
+        restore()
+      }
+    }
+  }
+
+  const invoke = <Result>(
+    name: string,
+    options: WithOTelOptions & { enabled: boolean },
+    params: readonly unknown[],
+    callback: () => Result,
+    root = false,
+  ): Result => {
+    const finish = begin(name, options, true, params, undefined, root)
+    let result: Result
+    try {
+      result = callback()
+    } catch (error) {
+      finish?.({ ok: false, error })
+      throw error
+    }
+    finish?.({ ok: true, value: result })
+    return result
+  }
+
+  const install = <Target extends AtomLike>(
+    target: Target,
+    options: WithOTelOptions,
+    enabled: boolean,
+  ): Target => {
+    if (isOTelInternal(target)) return target
+    const existing = optionsByTarget.get(target)
+    if (existing) {
+      Object.assign(existing, options)
+      existing.enabled ||= enabled
+      return target
+    }
+    const settings = { ...options, enabled }
+    optionsByTarget.set(target, settings)
+    if (isAction(target)) {
+      target.extend(
+        withActionMiddleware(
+          () =>
+            (next: Fn, ...params: unknown[]) =>
+              invoke(target.name, settings, params, () => next(...params)),
+        ),
+      )
+    } else {
+      const observer: ExecutionObserver = (event) => {
+        if (!isActive()) return
+        const execution = links.start(event.frame)
+        const finish = begin(
+          target.name,
+          settings,
+          false,
+          event.params,
+          event.previousState,
+          false,
+          execution,
+        )
+        return (outcome) => {
+          // Borrowed frames are inspected only at synchronous execution end.
+          // Promise completion retains the resulting owned ID pairs only.
+          observe(() =>
+            links.finish(event.frame, event.previousPubs, execution),
+          )
+          finish?.(outcome)
+        }
+      }
+      ;(target.__reatom._executionObservers ??= new Set()).add(observer)
+    }
+    return target
+  }
+  const withOTel = (options: WithOTelOptions = {}): GenericExt<AtomLike> =>
+    ((target: AtomLike) =>
+      install(target, options, true)) as GenericExt<AtomLike>
+
+  const rootOptions = { enabled: true }
+
+  return {
+    dispose: () => {
+      storage.dispose()
+      links.dispose()
+    },
+    withOTel,
+    auto: <Target extends AtomLike>(target: Target, enabled: boolean) =>
+      install(target, {}, enabled),
+    startTrace: <Result>(name: string, callback: () => Result): Result => {
+      if (!isActive()) return callback()
+      // A trace boundary retains the caller's dependency tracking. begin/end
+      // scope the overlay; wrap/bind retain it for async continuations.
+      return invoke(name, rootOptions, [], callback, true)
+    },
+    getCurrentContext: () => (isActive() ? storage.current() : undefined),
   }
 }

@@ -4,6 +4,7 @@ import { type Fn, isAbort, type Rec, type Unsubscribe } from '../utils'
 import type { Action, ActionState, Ext } from './'
 import { _enqueue, type Extend, extend, isAction, notify } from './'
 import { _createGlobal, ensureReatomGlobal, VERSION } from './globalStore'
+import { captureContinuation, enterContinuation } from './continuationContext'
 
 /*
 Atom call flow:
@@ -24,6 +25,20 @@ Atom call flow:
 
 let identity = <T>(value: T): T => value
 
+type ExecutionEvent = {
+  readonly frame: Frame
+  readonly kind: 'init' | 'compute' | 'set'
+  readonly params: readonly unknown[]
+  readonly previousState: unknown
+  readonly previousPubs: readonly (Frame | null)[]
+}
+type ExecutionOutcome =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly error: unknown }
+type ExecutionObserver = (
+  event: ExecutionEvent,
+) => ((outcome: ExecutionOutcome) => void) | void
+
 /**
  * Metadata associated with an atom instance that controls its behavior and
  * lifecycle. This interface is used internally by the Reatom framework and
@@ -43,6 +58,21 @@ export interface AtomMeta {
    * use `extend` instead.
    */
   readonly middlewares: Array<Fn>
+
+  /**
+   * Internal integration hook for actual atom executions, not reads. Kept in
+   * declarations for integrations; not intended for application code. Events
+   * borrow frames/params/pubs; do not retain them or mutate kernel state or
+   * input arrays. Only integration-owned variables and scoped continuation
+   * context may be set; restore scoped overlays in the returned end callback.
+   * Begin/end reads are untracked and failures are isolated. End runs before
+   * the kernel assigns the result. Actions use withActionMiddleware instead.
+   * Incidental reads may inspect plain data atoms without executing a pipeline
+   * or initializing a frame. Lazy/computed/middleware reads that need execution
+   * are refused before entering user code. Intentional writes, actions and
+   * subscriptions made by callbacks remain their effects; no rollback is done.
+   */
+  _executionObservers?: Set<ExecutionObserver>
 
   /**
    * @internal precompiled middleware chain, rebuilt by `_recompile` on each
@@ -213,6 +243,16 @@ export interface Frame<
 
   'var#abort': undefined | ReatomAbortController
 
+  /**
+   * Internal immutable, complete integration context. Integrations replace the
+   * record and acquire a context._continuationContextConsumers reference on
+   * first use, releasing it when the integration is disposed. Missing keys are
+   * explicit absence, not permission to inherit from another invocation.
+   * wrap/bind capture the effective record of their supplied frame and restore
+   * it during continuation. Application variables and the frame stay live.
+   */
+  _continuationContext?: Readonly<Record<`var#${string}`, unknown>>
+
   /** Reference to the atom itself */
   readonly atom: AtomLike<State, Params, Payload>
 
@@ -351,6 +391,23 @@ export interface RootFrame extends Frame<RootState, []> {}
  * contexts.
  */
 export interface ContextAtom extends AtomLike<RootState, [], RootFrame> {
+  /**
+   * Internal synchronous observation scope. Integrations save/restore this flag
+   * in finally, alongside untracked execution. Read restrictions cover the
+   * whole synchronous callback, including work it explicitly invokes. Observed
+   * application bodies and async continuations run outside this scope. Shared
+   * by integrations using this runtime.
+   */
+  _observation?: true
+
+  /**
+   * Internal count of active integration context consumers, shared across this
+   * runtime. Each consumer acquires once on first use and releases on disposal.
+   * At zero, bind/wrap skip capture lookup and installation. Resumed callbacks
+   * consult the live count; an already installed context always restores.
+   */
+  _continuationContextConsumers?: number
+
   /**
    * @internal
    * Number of `context.start` calls in this runtime. While it stays at `1`
@@ -919,11 +976,75 @@ export function _isPubsChanged(
   return false
 }
 
+// Called only when observers exist, keeping the unobserved path allocation-free.
+function observeExecution<T>(
+  frame: Frame,
+  kind: ExecutionEvent['kind'],
+  params: readonly unknown[],
+  previousState: unknown,
+  previousPubs: readonly (Frame | null)[],
+  run: (...args: any[]) => T,
+  runArgs: readonly unknown[] = params,
+  receiver?: unknown,
+): T {
+  let meta = frame.atom.__reatom
+  let event: ExecutionEvent = {
+    frame,
+    kind,
+    params,
+    previousState,
+    previousPubs,
+  }
+  let observers = [...meta._executionObservers!]
+  let endings: Array<(outcome: ExecutionOutcome) => void> = []
+  let observe = <Value>(callback: () => Value): Value | undefined => {
+    let linking = meta.linking
+    let previousObservation = context._observation
+    context._observation = true
+    meta.linking = false
+    try {
+      return callback()
+    } catch {
+      // Instrumentation must not change the application's result or tracking.
+      return undefined
+    } finally {
+      context._observation = previousObservation
+      meta.linking = linking
+    }
+  }
+  for (let observer of observers) {
+    let end = observe(() => observer(event))
+    if (typeof end === 'function') endings.push(end)
+  }
+  let outcome: ExecutionOutcome
+  try {
+    let value = Reflect.apply(run, receiver, runArgs) as T
+    outcome = { ok: true, value }
+    return value
+  } catch (error) {
+    outcome = { ok: false, error }
+    throw error
+  } finally {
+    for (let i = endings.length - 1; i >= 0; i--) {
+      observe(() => endings[i]!(outcome))
+    }
+  }
+}
+
 /** The hurt of atom internal logic */
 export function computedMiddleware(next: Fn, ...args: any[]) {
   let frame = STACK[STACK.length - 1]!
+  return computedImpl(frame, frame.atom.__reatom, next, args)
+}
 
-  let push = args.length > 0
+// The direct cache path already loaded these values; preserve that fast path.
+function computedImpl(
+  frame: Frame,
+  meta: AtomMeta,
+  next: Fn,
+  args: any[] | null,
+) {
+  let push = args !== null && args.length > 0
   let { state, pubs } = frame
   let dirty = pubs[0] === null
   let dependent = pubs.length !== 1
@@ -944,11 +1065,13 @@ export function computedMiddleware(next: Fn, ...args: any[]) {
 
       frame.pubs = [null]
       try {
-        frame.atom.__reatom.linking = true
-        frame.state = newState = next(newState)
+        meta.linking = true
+        frame.state = newState = meta._executionObservers?.size
+          ? observeExecution(frame, 'compute', [newState], newState, pubs, next)
+          : next(newState)
         frame.error = null
       } finally {
-        frame.atom.__reatom.linking = false
+        meta.linking = false
         frame.pubs[0] ??= frame.root.frame
         // TODO
         // Object.freeze(frame.pubs)
@@ -963,10 +1086,21 @@ export function computedMiddleware(next: Fn, ...args: any[]) {
     if (push) {
       push = false
 
-      let update = args[0]
+      let update = args![0]
 
-      newState = frame.state =
-        typeof update === 'function' ? update(newState) : update
+      newState = frame.state = meta._executionObservers?.size
+        ? observeExecution(
+            frame,
+            'set',
+            args!,
+            newState,
+            frame.pubs,
+            typeof update === 'function' ? update : identity,
+            [typeof update === 'function' ? newState : update],
+          )
+        : typeof update === 'function'
+          ? update(newState)
+          : update
       frame.error = null
       frame.pubs[0] = STACK[STACK.length - 2]!
 
@@ -1037,14 +1171,24 @@ export function _cacheImpl(next: Fn, args: null | any[], direct: boolean): any {
 
       try {
         if (isInit) {
-          frame.state = frame.state.initState()
+          frame.state = meta._executionObservers?.size
+            ? observeExecution(
+                frame,
+                'init',
+                [],
+                undefined,
+                frame.pubs,
+                frame.state.initState,
+                undefined,
+                frame.state,
+              )
+            : frame.state.initState()
         }
         isInit = false
         frame.state = direct
-          ? (reactive ? computedMiddleware : actionMiddleware)(
-              next,
-              ...(args ?? []),
-            )
+          ? reactive
+            ? computedImpl(frame, meta, next, args)
+            : actionMiddleware(next, ...(args ?? []))
           : args === null
             ? next()
             : next.apply(null, args)
@@ -1164,6 +1308,37 @@ export class AtomInitState {
   }
 }
 
+// Observation can inspect data without entering the application's graph.
+function readObservation(
+  target: AtomLike,
+  root: RootState,
+  setup: { initState?: unknown },
+  literalSetup: boolean,
+) {
+  let { middlewares, _frame } = target.__reatom
+  if (
+    middlewares.length !== 3 ||
+    middlewares[0] !== identity ||
+    middlewares[1] !== computedMiddleware ||
+    middlewares[2] !== cacheMiddleware
+  )
+    throw new ReatomError('Execution is not allowed during observation')
+
+  // Unlike _getFrame, this lookup does not migrate the default-store cache.
+  let frame =
+    root.store.get(target) ?? (_frame?.root === root ? _frame : undefined)
+  if (frame) {
+    if (frame.error != null) throw frame.error
+    if (!(frame.state instanceof AtomInitState)) return frame.state
+  } else if (literalSetup) {
+    // Only atom() supplies this private data object. Public createAtom setup
+    // can be a Proxy/accessor, so observation must not inspect it while cold.
+    let value = setup.initState
+    if (typeof value !== 'function') return value
+  }
+  throw new ReatomError('Execution is not allowed during observation')
+}
+
 export let createAtom: {
   <State>(
     setup: {
@@ -1185,15 +1360,21 @@ export let createAtom: {
     },
     name?: string,
   ): Atom<State>
-} = <State>(
+} = (setup, name = undefined) => createAtomImpl(setup, name, false)
+
+const createAtomImpl = <State>(
   setup: {
     initState?: State | (() => State)
-    computed?: (prev: State | undefined) => State
+    computed?: (prev: State) => State
     middlewares?: Fn[]
     reactive?: boolean
   },
-  name: string = named('atom', setup?.computed?.name),
+  name: string | undefined,
+  literalSetup: boolean,
 ): Atom<State> => {
+  // Resolve defaults in the body so the callable captures one scope.
+  if (name === undefined) name = named('atom', setup?.computed?.name)
+
   if (anonymousAtomNames.enabled) {
     name = 'anonymous'
   }
@@ -1216,6 +1397,14 @@ export let createAtom: {
       }
 
       let topFrame = top()
+      if (!write && context._observation) {
+        return readObservation(
+          target,
+          topFrame.root,
+          setup,
+          literalSetup,
+        ) as State
+      }
       let frame = (
         context.count === 1 ? meta._frame : _getFrame(target, topFrame.root)
       ) as undefined | Frame<State>
@@ -1324,7 +1513,8 @@ export let atom: {
   <T>(): Atom<T | undefined>
   <T>(createState: () => T, name?: string): Atom<T>
   <T>(initState: T, name?: string): Atom<T>
-} = (initState?: any, name?: string) => createAtom({ initState }, name)
+} = (initState?: any, name?: string) =>
+  createAtomImpl({ initState }, name, true)
 
 /**
  * Creates a derived state container that lazily recalculates only when read.
@@ -1492,6 +1682,45 @@ export let clearStack = () => {
   STACK.length = 0
 }
 
+const runContinuation = function <Params extends any[], Payload>(
+  this: Frame,
+  runtime: ContextAtom,
+  captured: Frame['_continuationContext'],
+  target: (...params: Params) => Payload,
+  ...params: Params
+): Payload {
+  if (runtime._continuationContextConsumers) {
+    const restore = enterContinuation(this, captured)
+    try {
+      return run.call(this, target, ...params) as Payload
+    } finally {
+      restore()
+    }
+  }
+  try {
+    STACK.push(this)
+    return target(...params)
+  } finally {
+    STACK.pop()
+  }
+}
+
+function runCustomContinuation<Params extends any[], Payload>(
+  this: Frame,
+  captured: Frame['_continuationContext'],
+  target: (...params: Params) => Payload,
+  ...params: Params
+): Payload {
+  const restore = context._continuationContextConsumers
+    ? enterContinuation(this, captured)
+    : undefined
+  try {
+    return target(...params)
+  } finally {
+    restore?.()
+  }
+}
+
 /**
  * Light version of `wrap` that binds a function to the current reactive
  * context.
@@ -1510,8 +1739,22 @@ export let clearStack = () => {
 export let bind = <Params extends any[], Payload>(
   target: (...params: Params) => Payload,
   frame = top(),
-): ((...params: Params) => Payload) =>
-  frame.run.bind(frame, target) as (...params: Params) => Payload
+): ((...params: Params) => Payload) => {
+  let captured = captureContinuation(frame)
+  let runner = frame.run
+  // Native partial application retains the runtime object, not its opt-in flag.
+  // Earlier continuations must notice later activation, without a module lookup
+  // or a per-call closure in the ordinary hot path.
+  if (runner === run)
+    return runContinuation.bind(frame, context, captured, target) as (
+      ...params: Params
+    ) => Payload
+  return runCustomContinuation.bind(
+    frame,
+    captured,
+    runner.bind(frame, target),
+  ) as (...params: Params) => Payload
+}
 
 /**
  * Mocks an atom or action for testing purposes.

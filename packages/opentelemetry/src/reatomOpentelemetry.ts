@@ -1,28 +1,52 @@
 import type { AtomLike, Ext } from '@reatom/core'
 import {
   addGlobalExtension,
+  context,
   EXTENSIONS,
   isAbort,
-  merge,
+  isSkip,
   removeItem,
 } from '@reatom/core'
 
 import { buildExportPayload } from './buildExportPayload.ts'
+import { buildResource } from './buildResource.ts'
 import type { OtlpSpan, SpanInput } from './buildSpan.ts'
 import { buildSpan } from './buildSpan.ts'
+import { createValueCapture } from './captureValues.ts'
 import type { Reservation, TelemetryStats } from './createBatchQueue.ts'
 import { createBatchQueue } from './createBatchQueue.ts'
 import { createExportWorker } from './createExportWorker.ts'
 import { flushWithBeacon } from './flushWithBeacon.ts'
 import { hexFromBytes } from './hexFromBytes.ts'
 import { observe } from './observation.ts'
+import { parseExportResponse } from './parseExportResponse.ts'
 import { resolveQueueOptions } from './queueOptions.ts'
-import { resourceAttributesVar } from './resourceAttributesVar.ts'
+import { readResourceAttributes } from './readResourceAttributes.ts'
 import type { RetryWithBackoffInput } from './retryWithBackoff.ts'
 import { retryWithBackoff } from './retryWithBackoff.ts'
+import { selectUnloadBatch } from './selectUnloadBatch.ts'
 import { sendTraces } from './sendTraces.ts'
+import { isOTelInternal } from './spanContext.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
+import { availableUnloadBytes, reserveUnloadBytes } from './unloadBudget.ts'
 import { createWithOTel } from './withOTel.ts'
+
+const MAX_RECORD_BYTES = 16_384
+const encoder = new TextEncoder()
+
+const resourceSnapshot = (
+  capture: ReturnType<typeof createValueCapture>,
+  value: Record<string, OtlpAttrValue>,
+): Record<string, OtlpAttrValue> => {
+  const snapshot = capture.capture('resource', value)
+  if (
+    typeof snapshot !== 'object' ||
+    Array.isArray(snapshot) ||
+    snapshot instanceof Uint8Array
+  )
+    throw new TypeError('Invalid resource attributes')
+  return snapshot
+}
 
 // Type-aware stable serializer for resource-attribute grouping. JSON.stringify
 // is unsafe here: it throws on bigint and emits non-canonical "{0:1,1:2,...}"
@@ -68,26 +92,32 @@ export interface ReatomOpentelemetryInput {
    * `resourceAttributesVar`.
    */
   resourceAttributes?: Record<string, OtlpAttrValue>
+  /**
+   * Capture bounded snapshots of application values. Disabled by default; `{}`
+   * opts in. A redaction failure discards the complete span.
+   */
+  captureValues?: false | { redact?: (key: string, value: unknown) => unknown }
   headers?: Record<string, string>
-  /** Auto-instrumentation predicate. Truthy = instrument, falsy = skip. */
+  /**
+   * Selects automatic spans. Filtered user targets still carry execution
+   * context through nested calls and wrap; no record or capture is created.
+   * Private adapter helpers are always excluded, before this predicate.
+   */
   filter?: (target: AtomLike) => boolean
   batchInterval?: number
   maxBatchSize?: number
   maxQueueSize?: number
   /** Budget for each batch export and, separately, each flush caller. */
   exportTimeoutMs?: number
+  /** Optional lower beacon limit within the shared 60 KiB document budget. */
   maxBeaconBytes?: number
   /**
    * Opt-in to `navigator.sendBeacon` for unload-time delivery. Default:
    * `false`.
    *
-   * Beacon can NOT be used with collectors that need custom auth headers, and
-   * because OTLP/JSON triggers a CORS preflight that browsers cannot run during
-   * page unload, beacon will silently drop spans on any cross-origin endpoint.
-   * The default transport is `fetch({ keepalive: true })`, which the browser
-   * holds open past page teardown without preflight blocking.
-   *
-   * Only enable this for same-origin collectors that don't need auth.
+   * Beacon cannot carry custom auth headers. Both transports are subject to
+   * CORS and a shared browser keepalive budget; delivery is best effort.
+   * Accepted beacon bytes remain charged for this document's lifetime.
    */
   useBeacon?: boolean
   /**
@@ -112,19 +142,29 @@ export interface ReatomOpentelemetryInput {
 }
 
 export interface ReatomOpentelemetry {
-  withOTel: ReturnType<typeof createWithOTel>
+  withOTel: ReturnType<typeof createWithOTel>['withOTel']
+  /** Start a separate root in the current store; preserve callback outcome. */
+  startTrace: ReturnType<typeof createWithOTel>['startTrace']
+  /** Current immutable pair, or undefined outside an admitted execution. */
+  getCurrentContext: ReturnType<typeof createWithOTel>['getCurrentContext']
   /** Wait for finished records present at invocation, up to exportTimeoutMs. */
   flush: () => Promise<void>
   /** Immutable snapshot of capacity, delivery and losses. */
   stats: () => TelemetryStats
-  /** Unregister the global extension, stop timers, remove unload listener. */
+  /** Stop new observation and batching; request abort of in-flight export. */
   dispose: () => void
 }
 
+/**
+ * Install tracing before creating application targets. Values are excluded
+ * unless captureValues is enabled; existing targets require local withOTel.
+ * Flush before disposal when delivery should be attempted at shutdown.
+ */
 export const reatomOpentelemetry = (
   input: ReatomOpentelemetryInput,
 ): ReatomOpentelemetry => {
   const queueOptions = resolveQueueOptions(input)
+  const pageDocument = typeof document === 'undefined' ? undefined : document
   // OTel mandate: a tracer must never escalate. Log once, move on.
   // Aborts after dispose() are expected — gate at the single sink so
   // every call site (queue.onError, keepalive .catch) inherits it.
@@ -139,10 +179,14 @@ export const reatomOpentelemetry = (
         error,
       )
     })
-  const resourceAttributes: Record<string, OtlpAttrValue> = merge(
-    { 'service.name': input.serviceName },
-    input.resourceAttributes,
-  )
+  const resourceAttributes = observe(() => {
+    const capture = createValueCapture()
+    const serviceName = capture.capture('service.name', input.serviceName)
+    return {
+      'service.name': serviceName,
+      ...resourceSnapshot(capture, input.resourceAttributes ?? {}),
+    }
+  })
   const version = input.version ?? ''
 
   // Each queue item carries its own resourceAttributesVar snapshot so a
@@ -152,7 +196,7 @@ export const reatomOpentelemetry = (
   // critical when traces from multiple environments share one batch window.
   type QueueItem = {
     span: OtlpSpan
-    resourceAttributes?: Record<string, OtlpAttrValue>
+    resourceAttributes: Record<string, OtlpAttrValue>
   }
   const groupItemsByResource = (
     items: readonly QueueItem[],
@@ -160,24 +204,16 @@ export const reatomOpentelemetry = (
     resourceAttributes: Record<string, OtlpAttrValue>
     spans: OtlpSpan[]
   }> => {
-    if (!items.some((i) => i.resourceAttributes)) {
-      return [{ resourceAttributes, spans: items.map((i) => i.span) }]
-    }
-    const keyOf = (override?: Record<string, OtlpAttrValue>) =>
-      stableKey({ ...resourceAttributes, ...override })
     const groups = new Map<
       string,
       { resourceAttributes: Record<string, OtlpAttrValue>; spans: OtlpSpan[] }
     >()
     for (const item of items) {
-      const key = keyOf(item.resourceAttributes)
+      const key = stableKey(item.resourceAttributes)
       let group = groups.get(key)
       if (!group) {
         group = {
-          resourceAttributes: {
-            ...resourceAttributes,
-            ...item.resourceAttributes,
-          },
+          resourceAttributes: item.resourceAttributes,
           spans: [],
         }
         groups.set(key, group)
@@ -194,6 +230,16 @@ export const reatomOpentelemetry = (
         version,
       })),
     })
+  const selectUnload = (items: readonly QueueItem[], beacon = false) =>
+    selectUnloadBatch({
+      items,
+      maxBytes: Math.min(
+        availableUnloadBytes(pageDocument!),
+        beacon ? (input.maxBeaconBytes ?? Infinity) : Infinity,
+      ),
+      // One complete ResourceSpans group per record allows exact linear sizing.
+      encode: (item) => JSON.stringify(payload([item]).resourceSpans[0]),
+    })
   const worker = createExportWorker<QueueItem>({
     exportTimeoutMs: queueOptions.exportTimeoutMs,
     onError: logExportError,
@@ -203,63 +249,73 @@ export const reatomOpentelemetry = (
           `[@reatom/opentelemetry] transport did not settle after abort; holding ${count} records`,
         ),
       ),
-    send: async (items, { signal, deadline, keepalive }) => {
-      const body = payload(items)
-      const response = await retryWithBackoff({
-        ...input.retry,
-        ...(keepalive ? { maxRetries: 0 } : {}),
-        signal,
-        deadline,
-        send: () =>
-          sendTraces({
-            endpoint: input.endpoint,
-            payload: body,
-            headers: input.headers,
-            fetch: input.fetch,
-            signal,
-            keepalive,
-          }),
-      })
-      if (!response.ok) {
-        await response.body?.cancel()
-        throw new Error(
-          `HTTP ${response.status} ${response.statusText}`.trimEnd(),
-        )
-      }
-      // A failed body read is an export failure, never an empty success.
-      const text = await response.text()
-      let parsed:
-        | { partialSuccess?: { rejectedSpans?: number; errorMessage?: string } }
-        | undefined
+    send: async (items, { signal, deadline, keepalive, excludeOversized }) => {
+      let credit: ReturnType<typeof reserveUnloadBytes> | undefined
+      let keptCount = items.length
+      let body: string | undefined
       try {
-        if (text) parsed = JSON.parse(text)
-      } catch {}
-      const ps = parsed?.partialSuccess
-      const rejected =
-        typeof ps?.rejectedSpans === 'number' ? ps.rejectedSpans : 0
-      if (
-        !Number.isSafeInteger(rejected) ||
-        rejected < 0 ||
-        rejected > items.length
-      ) {
-        throw new Error('Invalid OTLP rejectedSpans')
-      }
-      if (rejected)
-        observe(() =>
-          console.warn(
-            `[@reatom/opentelemetry] OTLP export to ${input.endpoint}: partialSuccess rejected ${rejected} spans${ps?.errorMessage ? ': ' + ps.errorMessage : ''}`,
-          ),
-        )
-      return {
-        exported: items.length - rejected,
-        beaconAccepted: 0,
-        droppedByReason: rejected ? { export: rejected } : {},
+        if (keepalive) {
+          const selected = selectUnload(items)
+          keptCount = selected.keptCount
+          excludeOversized(selected.droppedCount)
+          if (keptCount === 0)
+            return { exported: 0, beaconAccepted: 0, droppedByReason: {} }
+          body = selected.body
+          credit = reserveUnloadBytes(
+            pageDocument!,
+            encoder.encode(body).length,
+          )
+        }
+        const data = body === undefined ? payload(items) : undefined
+        const response = await retryWithBackoff({
+          ...input.retry,
+          ...(keepalive ? { maxRetries: 0 } : {}),
+          signal,
+          deadline,
+          send: () =>
+            sendTraces({
+              endpoint: input.endpoint,
+              payload: data,
+              body,
+              headers: input.headers,
+              fetch: input.fetch,
+              signal,
+              keepalive,
+            }),
+        })
+        if (!response.ok) {
+          await response.body?.cancel()
+          throw new Error(
+            `HTTP ${response.status} ${response.statusText}`.trimEnd(),
+          )
+        }
+        // A body read remains part of the transport and its byte reservation.
+        const outcome = parseExportResponse(await response.text(), keptCount)
+        if (outcome.rejected || outcome.errorMessage)
+          observe(() =>
+            console.warn(
+              `[@reatom/opentelemetry] OTLP export to ${input.endpoint}: partialSuccess rejected ${outcome.rejected} spans${outcome.errorMessage ? ': ' + outcome.errorMessage : ''}`,
+            ),
+          )
+        return {
+          exported: outcome.accepted,
+          beaconAccepted: 0,
+          droppedByReason: outcome.rejected ? { export: outcome.rejected } : {},
+        }
+      } finally {
+        credit?.release()
       }
     },
   })
+
   const queue = createBatchQueue<QueueItem>({
     ...queueOptions,
-    send: worker.send,
+    send: (lease) => {
+      // A full batch can be committed before the observed execution settles.
+      // Transport wrappers may read application state; run them after capture.
+      if (context._observation) queueMicrotask(() => worker.send(lease))
+      else worker.send(lease)
+    },
     onError: logExportError,
     isQuarantined: worker.isQuarantined,
     onFlushTimeout: (unfinished) =>
@@ -274,56 +330,123 @@ export const reatomOpentelemetry = (
     const reservation = queue.reserve()
     if (!reservation) return
     return {
-      commit: (span) =>
-        reservation.commit({
-          span: buildSpan(span),
-          resourceAttributes: resourceAttributesVar.get(),
-        }),
+      commit: (span) => {
+        if (!resourceAttributes) {
+          reservation.cancel('observation')
+          return
+        }
+        // Bound metadata before encoding; application graphs were already
+        // normalized by capture. The batch envelope has a separate budget.
+        if (
+          span.name.length > MAX_RECORD_BYTES ||
+          version.length > MAX_RECORD_BYTES
+        ) {
+          reservation.cancel('oversized')
+          return
+        }
+        const override = readResourceAttributes()
+        const resources =
+          override === undefined
+            ? resourceAttributes
+            : {
+                ...resourceAttributes,
+                ...resourceSnapshot(createValueCapture(), override),
+              }
+        const record = { span: buildSpan(span), resourceAttributes: resources }
+        const size = encoder.encode(
+          JSON.stringify({
+            span: record.span,
+            resource: buildResource(resources),
+            scope: { name: '@reatom/opentelemetry', version },
+          }),
+        ).length
+        if (size > MAX_RECORD_BYTES) reservation.cancel('oversized')
+        else reservation.commit(record)
+      },
       cancel: reservation.cancel,
       skip: reservation.skip,
     }
   }
-  const withOTel = createWithOTel({ reserveSpan, isActive: () => !disposed })
+  const tracing = createWithOTel({
+    reserveSpan,
+    isActive: () => !disposed,
+    captureValues: input.captureValues,
+  })
 
   const globalExt: Ext = (target) => {
-    if (input.filter && !input.filter(target)) return target
-    return target.extend(withOTel())
+    if (isOTelInternal(target)) return target
+    return tracing.auto(
+      target,
+      !isSkip(target) && (input.filter ? !!input.filter(target) : true),
+    )
   }
   addGlobalExtension(globalExt)
 
   const flushNow = () => {
-    if (disposed) return
+    if (disposed || !pageDocument) return
     const lease = queue.takeForUnload()
     if (!lease) return
     if (input.useBeacon !== true) {
       worker.send(lease, true)
       return
     }
+    let credit: ReturnType<typeof reserveUnloadBytes> | undefined
+    let keptCount = lease.items.length
+    let excluded = 0
     try {
-      const result = flushWithBeacon({
-        endpoint: input.endpoint,
-        spans: lease.items,
-        buildPayload: payload,
-        maxBeaconBytes: input.maxBeaconBytes,
-        sendBeacon: input.sendBeacon,
+      const selected = selectUnload(lease.items, true)
+      keptCount = selected.keptCount
+      excluded = selected.droppedCount
+      if (keptCount === 0) {
+        lease.release({
+          exported: 0,
+          beaconAccepted: 0,
+          droppedByReason: { oversized: excluded },
+        })
+        return
+      }
+      credit = reserveUnloadBytes(
+        pageDocument,
+        encoder.encode(selected.body).length,
+      )
+      const endpoint = input.endpoint
+      const sendBeacon = input.sendBeacon
+      if (disposed) {
+        lease.release({
+          exported: 0,
+          beaconAccepted: 0,
+          droppedByReason: { disposed: keptCount, oversized: excluded },
+        })
+        return
+      }
+      const accepted = flushWithBeacon({
+        endpoint,
+        body: selected.body,
+        sendBeacon,
       })
+      if (accepted) credit.acceptBeacon()
       lease.release({
         exported: 0,
-        beaconAccepted: result.accepted ? result.selectedCount : 0,
+        beaconAccepted: accepted ? keptCount : 0,
         droppedByReason: {
-          oversized: lease.items.length - result.selectedCount,
-          export: result.accepted ? 0 : result.selectedCount,
+          oversized: excluded,
+          export: accepted ? 0 : keptCount,
         },
       })
-      if (!result.accepted)
+      if (!accepted)
         logExportError(new Error('beacon delivery failed'), lease.items)
     } catch (error) {
       lease.release({
         exported: 0,
         beaconAccepted: 0,
-        droppedByReason: { export: lease.items.length },
+        droppedByReason: {
+          oversized: excluded,
+          [disposed ? 'disposed' : 'export']: keptCount,
+        },
       })
       logExportError(error, lease.items)
+    } finally {
+      credit?.release()
     }
   }
 
@@ -347,12 +470,15 @@ export const reatomOpentelemetry = (
   }
 
   return {
-    withOTel,
+    withOTel: tracing.withOTel,
+    startTrace: tracing.startTrace,
+    getCurrentContext: tracing.getCurrentContext,
     stats: queue.stats,
     flush: queue.flush,
     dispose: () => {
       if (disposed) return
       disposed = true
+      tracing.dispose()
       queue.dispose()
       worker.dispose()
       removeItem(EXTENSIONS, globalExt)

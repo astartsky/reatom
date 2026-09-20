@@ -15,6 +15,7 @@ import {
 import type { OtlpSpan } from './buildSpan.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
+import type { ParsedSpan } from './test-helpers.ts'
 import {
   attrsOf,
   findSpan,
@@ -25,7 +26,6 @@ import {
   parseSpans,
   withWarnSpy,
 } from './test-helpers.ts'
-import type { ParsedSpan } from './test-helpers.ts'
 
 interface ReceivedRequest {
   method: string
@@ -125,7 +125,7 @@ const resourceAttributesOf = (
   JSON.parse(received[i]!.body).resourceSpans[0].resource.attributes
 
 test('a sync action ships a span with action-shaped attributes', async () => {
-  const otel = start()
+  const otel = start({ captureValues: {} })
   const greet = action((name: string) => `hi ${name}`, 'integration.greet')
 
   context.start(() => {
@@ -180,7 +180,7 @@ test('nested actions share a trace; inner span parents to the outer', async () =
 })
 
 test('async action records endTime after the awaited work', async () => {
-  const otel = start()
+  const otel = start({ captureValues: {} })
   const slow = action(async () => {
     await wrap(sleep(20))
     return 'done'
@@ -219,7 +219,7 @@ test('two entry points produce two distinct traces', async () => {
 })
 
 test('atom transitions ship spans with prev/next state attributes', async () => {
-  const otel = start()
+  const otel = start({ captureValues: {} })
   const counter = atom(0, 'integration.counter')
 
   context.start(() => {
@@ -346,9 +346,9 @@ test('partialSuccess on 2xx surfaces a warning with the rejected count', async (
   })
 })
 
-test('partialSuccess with rejectedSpans=0 emits no warning (success ack with hint)', async () => {
+test('partialSuccess with rejectedSpans=0 reports the server warning without dropping', async () => {
   // Spec: rejectedSpans=0 + non-empty errorMessage means "all accepted, but
-  // here is a server-side warning (e.g. deprecation). Don't spam ops with it.
+  // here is a server-side warning (e.g. deprecation). Preserve that diagnostic.
   responder = () => ({
     status: 200,
     headers: { 'Content-Type': 'application/json' },
@@ -365,7 +365,9 @@ test('partialSuccess with rejectedSpans=0 emits no warning (success ack with hin
 
     await otel.flush()
 
-    expect(warnSpy).not.toHaveBeenCalled()
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(String(warnSpy.mock.calls[0]![0])).toContain('soft warning')
+    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
   })
 })
 
@@ -748,7 +750,7 @@ test('deep mixed chain: action -> atom.set -> computed atom -> nested action sha
 })
 
 test('a failing nested action emits an error span and exception event without poisoning siblings', async () => {
-  const otel = start()
+  const otel = start({ captureValues: {} })
   const fail = action(() => {
     throw new Error('boom')
   }, 'chain.fail')
@@ -793,10 +795,13 @@ test('a failing nested action emits an error span and exception event without po
       attributes: expect.objectContaining({
         'exception.type': 'Error',
         'exception.message': 'boom',
-        'exception.escaped': true,
       }),
     }),
   ])
+
+  expect(
+    Object.hasOwn(failSpan.events[0]!.attributes, 'exception.escaped'),
+  ).toBe(false)
 
   // Sibling and parent must remain unset-status (instrumentation does not
   // pre-fill OK; only application code sets that).

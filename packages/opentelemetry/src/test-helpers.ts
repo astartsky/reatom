@@ -1,5 +1,5 @@
 import type { MockInstance } from 'vitest'
-import { vi } from 'vitest'
+import { onTestFinished, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
 import { createWithOTel } from './withOTel.ts'
@@ -8,11 +8,16 @@ import { createWithOTel } from './withOTel.ts'
 export const createTestWithOTel = (input: {
   queueSpan: (span: SpanInput) => void
   isActive: () => boolean
-}) =>
-  createWithOTel({
+  captureValues?: Parameters<typeof createWithOTel>[0]['captureValues']
+}) => {
+  const tracing = createWithOTel({
     isActive: input.isActive,
+    captureValues: input.captureValues,
     reserveSpan: () => ({ commit: input.queueSpan, cancel() {}, skip() {} }),
   })
+  onTestFinished(tracing.dispose)
+  return tracing.withOTel
+}
 
 /**
  * Decodes an OTLP span's attribute KeyValue array into a plain record of

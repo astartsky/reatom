@@ -14,6 +14,7 @@ npm install @reatom/opentelemetry
 ## Quick start
 
 ```ts
+import { wrap } from '@reatom/core'
 import { reatomOpentelemetry } from '@reatom/opentelemetry'
 
 const otel = reatomOpentelemetry({
@@ -22,9 +23,18 @@ const otel = reatomOpentelemetry({
   version: '1.0.0',
 })
 
-// Every atom/action created from this point on is auto-instrumented.
-// On page unload, the queue is flushed via `fetch({ keepalive: true })`.
+// Eligible atoms/actions created from this point on emit execution metadata.
+// Parameter and result values are not captured by default.
+// Import modules that create application models after installing tracing.
+await wrap(import('./app.ts'))
 ```
+
+Static imports run before the statements in their module. Writing
+`import './app.ts'` below the factory call does not delay model creation; use
+the dynamic import above or create models explicitly after the factory.
+The default is metadata only. See [value capture](#value-capture-and-size-limits)
+for explicit opt-in and redaction. During page unload, the adapter attempts
+`fetch({ keepalive: true })` within the shared document budget.
 
 For same-origin collectors that don't need auth headers, you can opt into
 `navigator.sendBeacon` for unload-time delivery:
@@ -40,23 +50,96 @@ const otel = reatomOpentelemetry({
 
 ## Trace context model
 
-Each instrumented atom or action emits one span. A trace ID is created at the
-first instrumented entry point and inherited by descendants in the same Reatom
-frame tree. Subsequent entry points (a new event handler, a fresh timer, an
-external callback) start a new trace.
+Spans describe actual executions: action calls, lazy initializer bodies,
+computed bodies and atom writes (including equal-value writes). Cached reads
+and dependency validation without recomputation emit no span. A constant atom's
+initial value has no initializer body to observe.
 
-```text
-traceId = traceIdVar.get() ?? generateTraceId()
-parentSpanId = traceIdVar.get() ? spanIdVar.get() : undefined
-spanIdVar.set(generateSpanId())
+Reads made while inspecting telemetry are untracked and cannot start lazy
+initialization, computed validation or custom read middleware. Plain atom data
+can be read without entering its pipeline; cold user-supplied `createAtom`
+setups are not inspected. A refused read is an observation failure. These
+restrictions cover the whole synchronous observation callback, including work
+it explicitly invokes. The observed application body and async continuations
+run outside that scope. Explicit writes, actions and subscriptions made by
+observation callbacks remain their own effects and are not rolled back; a
+refused read in such a write can leave the target's ordinary cached error.
+
+Each adapter keeps its own immutable `{ traceId, spanId }` pair on the executing
+Reatom frame. Children inherit that execution parent; reading cached reactive
+data does not adopt the data's old trace. Independent calls begin separate
+traces. Use `await wrap(promise)` to preserve the Reatom context across an await.
+
+Use an explicit root to group sibling operations:
+
+```ts
+otel.startTrace('checkout', () => {
+  reserveItems()
+  submitOrder()
+})
+
+// Inside an instrumented action or explicit root:
+const current = otel.getCurrentContext() // Readonly<{ traceId, spanId }> | undefined
 ```
 
-Per the OTel spec: one span belongs to exactly one trace; one trace has
-exactly one root span; child spans inherit the parent trace ID.
+`startTrace` creates a real root span, even inside another trace. It preserves
+the callback's result, original Promise or thrown value, reactive dependency
+tracking, current store and cancellation scope. After it returns, the outer
+context is restored. A disposed
+adapter calls the callback directly. `getCurrentContext()` returns `undefined`
+outside an admitted execution or after disposal.
 
-`traceIdVar` and `spanIdVar` are exported and frame-scoped — read them inside
-your own actions to correlate logs with traces, or set them at an explicit
-entry-point boundary if you need a deterministic trace ID.
+`wrap` and `bind` preserve the trace context captured for each continuation,
+including overlapping computations on one Reatom frame and the absence of a
+trace when registered outside one. Calling an older callback inside a new trace
+does not attach it to that trace. Only integration context is snapshotted;
+application state and ordinary Reatom variables retain their usual behavior.
+
+The first traced execution enables continuation context handling for this Reatom
+runtime. While any adapter that has used it remains active, `bind`/`wrap` capture
+context and temporarily restore it on resume. Disposing the last such adapter
+returns subsequent calls to the path without context lookup or installation.
+Older callbacks still preserve their registration context, including absence,
+if another adapter later enables tracing. Disposal during a running continuation
+does not prevent restoration of its caller's context.
+The shared consumer count is still checked at registration and resume to detect
+later activation.
+
+If capacity rejects an ordinary span, its children retain any admitted parent.
+If capacity rejects an explicit root, an ID-free boundary prevents children
+from adopting the outer trace, including after `await wrap`. Once capacity is
+available, each admitted child begins a fresh trace; its own children inherit
+it normally. This deliberately loses sibling grouping under overload instead
+of inventing a root span that was never admitted. Later export loss does not
+rewrite already inherited IDs.
+
+**Source-breaking change in this unreleased API:** independent writable
+`traceIdVar` and `spanIdVar` exports are removed. Read the coherent pair through
+`otel.getCurrentContext()` and establish roots through `otel.startTrace()`.
+There is no setter for partial IDs, SDK context bridge or remote-parent API.
+`resourceAttributesVar` remains a separate, shared ambient resource override.
+
+### Links between changed inputs
+
+Reactive executions can include `links` to earlier observed executions that
+changed established inputs in the same Reatom store. Links contain complete
+`traceId`/`spanId` pairs and do not change the execution parent; a linked input
+may belong to an older trace. Equal state and error values, first reads, and
+newly added or removed dependencies do not produce links.
+
+The adapter compares the old and current dependency graphs synchronously. It
+selects the nearest eligible observed execution on each changed branch. When a
+copied frame has no context, it may follow that branch's changed inputs instead.
+It never substitutes the latest span for a target, or links the execution to
+itself or its own descendants. Ambiguous matches and unobserved causes can be
+omitted: these links describe established input changes, not complete historical
+causality.
+
+Each span retains at most 32 distinct pairs. Matching inspects at most 256
+dependency entries across both graphs; a branch whose complete local match
+does not fit is omitted. Only owned ID pairs survive synchronous completion.
+Weak frame keys hold execution metadata without retaining prior frames, values
+or dependency arrays, and disposal clears that metadata.
 
 ### Per-trace resource attributes
 
@@ -72,7 +155,15 @@ const trackExperiment = action(() => {
 ```
 
 Values merge into the construction-time `resourceAttributes` (var keys win)
-at queue time and ship on the next batch flush. Spans with distinct resource
+at queue time and ship on the next batch flush. Factory defaults are copied
+at construction; ambient overrides are copied when each span completes.
+These bounded snapshots own nested records, arrays and byte arrays, so later
+mutations do not change queued data. The ambient slot is intentionally shared:
+all adapters in the same Reatom frame see the override while keeping their
+own factory defaults. Prefer span attributes for session, user and route data;
+application keys are never automatically promoted to Resource attributes.
+
+Spans with distinct resource
 attributes are placed in **separate `resourceSpans` entries** within one
 exported batch — each unique resource set keeps its own grouping per OTLP, so
 traces from multiple environments or feature variants in the same batch
@@ -86,13 +177,14 @@ reatomOpentelemetry({
   serviceName: string                                // sets `service.name` resource attribute
   version?: string                                   // emitted as instrumentation `scope.version` (recommended)
   resourceAttributes?: Record<string, OtlpAttrValue> // extra resource attributes (e.g. deployment.environment)
+  captureValues?: false | { redact?: (key: string, value: unknown) => unknown } // default false
   headers?: Record<string, string>                   // attached to every fetch (auth, API keys)
-  filter?: (target: AtomLike) => boolean             // auto-instrument predicate; truthy keeps it
+  filter?: (target: AtomLike) => boolean             // select spans; filtered targets still carry context
   batchInterval?: number                             // default 3000 ms
   maxBatchSize?: number                              // default 100
   maxQueueSize?: number                              // default 1000
   exportTimeoutMs?: number                           // default 30000; separate batch and flush budgets
-  maxBeaconBytes?: number                            // default 63000 (under 64 KB browser limit, beacon path only)
+  maxBeaconBytes?: number                            // optional lower beacon limit; shared budget is at most 60 KiB
   useBeacon?: boolean                                // default false; opt-in for same-origin collectors without auth headers
   retry?: {                                          // OTLP retry tuning; defaults: 3 retries, 1s base, 30s cap, full jitter
     maxRetries?: number
@@ -107,6 +199,8 @@ The factory returns:
 ```ts
 {
   withOTel: (options?: { kind?: SpanKind }) => Ext   // see "Per-target overrides" below
+  startTrace: <T>(name: string, callback: () => T) => T // new root in the current store
+  getCurrentContext: () => SpanContext | undefined   // immutable IDs for this adapter
   flush: () => Promise<void>                         // waits for the finished records present at invocation
   stats: () => TelemetryStats                        // immutable capacity and delivery snapshot
   dispose: () => void                                // unregisters the global extension and unload listeners
@@ -135,8 +229,14 @@ reatomOpentelemetry({
 })
 ```
 
-Atoms/actions that fail the filter are not instrumented. Manual
-`.extend(otel.withOTel())` still works on filtered targets.
+Automatic spans also exclude targets hidden by Reatom's `isSkip`: names that
+start with `_` or contain `._`. The custom filter further narrows eligibility.
+Filtered user targets emit no span and do not reserve capacity or inspect
+values. They still receive an execution-context carrier so nested calls and
+`await wrap` preserve their admitted parent. This can install middleware on
+actions; it is not a promise of zero instrumentation overhead. Manual
+`.extend(otel.withOTel())` explicitly enables a filtered or hidden target. Private adapter
+helpers remain excluded before any custom filter, across all adapters.
 
 ### Per-target overrides
 
@@ -145,34 +245,53 @@ the global extension already instrumented merges the options (later override
 wins) instead of installing a second middleware. So a global filter plus a
 local kind override produces exactly one span per call.
 
+To opt in only selected targets, combine a global filter with a local extension:
+
+```ts
+const otel = reatomOpentelemetry({
+  endpoint: 'https://collector.example.com',
+  serviceName: 'my-app',
+  filter: () => false,
+})
+const save = action((id: number) => persist(id), 'save').extend(otel.withOTel())
+```
+
+Filtered targets can still carry context to their children. The filter controls
+span admission, not an instrumentation-free execution mode.
+
 ## Span shape
 
-| Target              | Attributes emitted on success     | Status on resolve | Status on reject                                     |
+By default, spans contain execution metadata and no parameter, result or state
+values. With `captureValues: {}`, the additional attributes are:
+
+| Target              | Opt-in attributes on success      | Status on resolve | Status on reject                                     |
 | ------------------- | --------------------------------- | ----------------- | ---------------------------------------------------- |
 | Action (sync)       | `params`, `payload`               | unset             | `error` (unset for `AbortError` / suspension)        |
 | Action (async)      | `params`, `payload` (final value) | unset on resolve  | `error` on reject                                    |
 | Atom set / computed | `prevState`, `nextState`          | unset             | `error` (atom suspension is rethrown without a span) |
 
-Per the OTel API spec, `STATUS_CODE_OK` is reserved for application code —
-instrumentation libraries leave success spans **unset**. Setting `OK`
-explicitly via `setStatus` in your action is honored; auto-instrumentation
-does not pre-fill it.
+Successful executions leave span status **unset**. Application failures use
+error status; cancellation and suspension follow the control-flow rules below.
 
-`AbortError` and thrown `Promise` (Reatom's suspension primitive) are control
-flow, not failures — they record a span with status **unset** and the payload
-tagged `[AbortError ...]` or `[Suspension]`.
+Action `AbortError` and thrown `Promise` (Reatom's suspension primitive) are
+control flow: status stays **unset**, with fixed `[AbortError]` or `[Suspension]`
+markers by default. Opt-in abort reasons pass through capture and redaction.
+Synchronous atom suspension emits no span. Ordinary exceptions emit an
+`exception` event with only a safely obtained built-in `exception.type` by
+default (opaque exceptions use `Error`). Message, stack and status message
+require opt-in. `exception.escaped` is never inferred or emitted. This package
+keeps span exception events for its v1 wire compatibility; evolving exception
+semantic conventions do not add a logs transport to this API.
 
 ## Behavior reference
 
 ### Auto-instrumentation timing
 
-`addGlobalExtension` fires twice for actions: once during `createAtom` (while
-Reatom's `reactive` flag is still `true`) and once at the end of `action()`
-after the flip. The package classifies targets by **structural middleware
-shape** (`actionMiddleware` presence) rather than the `isAction` flag, and
-defers the install on the first invocation so `withActionMiddleware`'s own
-`isAction` assertion passes the second time. Atoms created **before**
-`reatomOpentelemetry()` is called are not retroactively instrumented.
+The factory instruments eligible atoms and actions created after it is called.
+Existing targets are not retroactively instrumented. To select a previously
+created target explicitly, apply `target.extend(otel.withOTel())` while the
+adapter is active. The extension preserves the target reference and its
+existing properties.
 
 ### Queue overflow — drop newest
 
@@ -183,8 +302,8 @@ JS SDK
 default and aligns with the spec, which mandates dropping but leaves direction
 to implementations.
 
-The unload-time beacon path (`useBeacon: true`) inverts this: it drops the
-**oldest** spans to fit `maxBeaconBytes`. The asymmetry is deliberate — under
+Unload selection inverts this: it keeps the newest eligible spans within
+the available byte budget. The asymmetry is deliberate — under
 sustained overload the earliest spans likely capture the trigger, while at
 unload the most recent spans are closest to the event under investigation.
 
@@ -197,38 +316,39 @@ Two listeners are registered:
   bf-cache transitions without flipping `visibilityState`, so the visibility
   guard is intentionally absent here.
 
-The default unload transport is `fetch({ keepalive: true })`. The browser
-holds the connection open past page teardown without preflight blocking, the
-fetch can carry your auth `headers`, and there is no payload size cap beyond
-the browser's keepalive budget (~64 KB total across concurrent keepalive
-fetches in most engines).
+The default unload transport is `fetch({ keepalive: true })`. It carries your
+`headers` and lets the browser continue the request after page teardown. Both
+fetch and beacon remain subject to CORS; keepalive does not bypass preflight.
+Delivery during unload is best effort.
 
-Unload sends **bypass retry** — there is no time during page teardown for
-exponential backoff. A failed unload flush is logged via `console.warn` and
-the spans are lost; the in-flight retry behavior described under "Transport"
-applies only to non-unload batches.
+Unload sends use the same single transport slot as ordinary exports and do not
+retry. If the slot is busy, records stay queued. Repeated lifecycle events do
+not duplicate a leased batch. Environments without a document do not start an
+unload send.
 
-`navigator.sendBeacon` is **opt-in** via `useBeacon: true`. It is only safe
-for same-origin collectors that do not require auth headers — beacon cannot
-carry custom headers, and an OTLP/JSON `Content-Type` triggers a CORS
-preflight that the browser cannot run during unload, so beacon will silently
-drop spans on cross-origin endpoints.
+Both unload transports select at most `maxBatchSize` newest queued records
+within a **60 KiB UTF-8 budget**, including Resource, scope, spans and the JSON
+envelope. Adapters from one loaded package copy share the remaining budget for
+that document. Pending keepalive fetch bytes stay charged until response-body
+settlement or cleanup, including after abort. Accepted beacon bytes stay
+charged until the document is discarded: the browser provides no settlement
+notification. Disposing or recreating an adapter does not reset these credits.
+Other libraries share the browser's quota but are outside this counter, so the
+local headroom is not a delivery guarantee.
 
-#### Beacon truncation — drop oldest
+`navigator.sendBeacon` is opt-in via `useBeacon: true` and cannot send custom
+auth headers. `maxBeaconBytes` can lower its per-request limit; it cannot raise
+the shared 60 KiB budget. Browser acceptance increments `beaconAccepted`, not
+`exported`. Refusal or an exception counts the selected records as export
+failures and releases their byte reservation.
 
-When `useBeacon: true` and the unload-time payload exceeds `maxBeaconBytes`
-(default 63000), the **oldest** spans are dropped first — newest spans are
-closest to the unload event and most likely the cause being investigated.
-
-The fit search is a binary search over the sorted span list. With multiple
-distinct `resourceAttributesVar` snapshots in the same batch, the payload
-size is **not strictly monotonic** in the number of survivors: dropping the
-sole member of a resource group also removes that group's `resourceSpans`
-envelope, so fewer spans can occasionally produce a larger payload-per-span
-ratio. The search may then converge to a slightly suboptimal cut and drop a
-handful more spans than the theoretical optimum. In practice the gap is one
-to two spans per group boundary; the common single-resource-group case is
-strictly monotonic and unaffected.
+Selection encodes each considered owned record once, newest first. An
+individually oversized record is excluded; when the remaining space cannot
+hold an eligible record, the older remainder is excluded. The selected records
+retain their original order, with one ResourceSpans group per record. Exclusions
+count as `droppedByReason.oversized`. Older records outside the leased batch
+remain queued. The whole lease, including exclusions, stays held until transport
+settlement or beacon handoff.
 
 ### Transport — retry and backoff
 
@@ -241,6 +361,13 @@ Backoff is exponential with full jitter; the `Retry-After` header (delta
 seconds or HTTP-date) overrides the computed delay when present. After retries
 are exhausted, a non-2xx response is **logged via `console.warn` through the
 batch queue's `onError`** — the tracer never escalates failures to your app.
+
+A 2xx response is never retried, including partial success or a malformed body.
+Valid `partialSuccess.rejectedSpans` counts become export drops for the rejected
+part; the remainder increments `exported`. A zero count with an error message
+produces a warning without a drop. Invalid nonempty response bodies count the
+sent records as export failures. Unload records excluded before sending retain
+their separate `oversized` reason.
 
 ### `flush()` semantics
 
@@ -290,22 +417,49 @@ newest queued records. If the slot is busy, records remain queued. Beacon
 acceptance is a terminal handoff to the browser, counted as `beaconAccepted`,
 not confirmed delivery in `exported`.
 
-### Serialization
+### Value capture and size limits
 
-Span attribute values pass through `serialize()`:
+Enable value capture explicitly and remove sensitive data before normalization:
 
-- Primitives pass through unchanged.
-- `Atom` / `Action` → `[Atom name]` / `[Action name]` markers.
-- `Error` / `AbortError` → `[Error message]` markers (`cause` chain walked up to 3 levels deep).
-- `Promise`, `Date`, `RegExp`, `Map`, `Set`, typed arrays, `WeakMap`/`WeakSet` →
-  meaningful markers.
-- Non-finite numbers (`NaN`, `±Infinity`) emit as protobuf-JSON strings.
-- Cycles are detected and replaced with `[Circular]`.
-- Hostile getters / Proxy traps / throwing `Symbol.toPrimitive` cannot escape
-  serialization — they yield `[Unserializable]` and never throw out of
-  instrumentation.
-- Nested structures are depth-limited (default 2) — deeper levels collapse to
-  `[Object]` / `[Array]` / `[Map]` / `[Set]` markers.
+```ts
+const otel = reatomOpentelemetry({
+  endpoint: 'https://collector.example.com',
+  serviceName: 'my-app',
+  captureValues: {
+    redact: (key, value) => (key === 'password' ? '[redacted]' : value),
+  },
+})
+```
+
+Admission precedes capture. Action parameters are copied before the body;
+results are copied on completion, including Promise settlement. One capture
+session shares a depth limit of 2, 100 traversal slots, a 2048 UTF-16-unit
+string limit and an 8192-byte budget across those snapshots. Bytes count UTF-8
+JSON key/value pairs, including escaping and markers; byte arrays use base64
+and int64 bigints use decimal strings for this accounting. Reservations are
+conservative, so truncation may happen before the byte ceiling.
+
+Only data descriptors are read. Application getters, `toJSON`, iterators and
+coercion methods are not called; accessors become `[Skipped]`. Plain records,
+arrays and byte arrays are copied; opaque objects and functions use fixed
+markers. Cycles become `[Circular]`, budget exhaustion becomes `[Truncated]`.
+Non-finite numbers use fixed strings, and bigints outside int64 use a fixed
+`[Unsafe bigint]` marker. Native lazy Error stack accessors are omitted too;
+capture does not run stack formatters. DOMException name/message are read
+through their branded native getters.
+
+Redaction and Proxy failures discard the complete span as `observation`,
+without exporting the original input as a fallback. Proxy traps and redaction
+are user code: output and traversal limits cannot guarantee a CPU limit or
+undo their effects. `ownKeys` can also materialize all keys before the bounded
+descriptor traversal. Capture should be observational, not modify application
+state.
+
+Resources use separate bounded snapshots even with value capture disabled.
+Before admission to the queue, the complete record has a 16384-byte UTF-8 JSON
+limit covering the encoded span, merged Resource and instrumentation scope.
+Oversized records release their reservation and count once as `oversized`.
+This record limit is separate from the batch envelope and unload budgets.
 
 ### `dispose()`
 
@@ -338,17 +492,9 @@ ignored by the disposed adapter.
   guaranteed. The adapter handles failures in its own observer chains.
 - v1 ships **traces only** — no metrics, no logs, no W3C `traceparent`
   propagation to outgoing fetches, no offline buffering, no compression.
-- Trace context is read from the caller frame on the JS call stack. If you
-  invoke multiple instrumented entry points from the same synchronous tick
-  (e.g. several `context.start(...)` calls in a row, or multiple actions
-  fired from one event handler), each gets its own trace correctly. Wrap an
-  entry point in `traceIdVar.spawn(() => ...)` if you need a deterministic
-  trace ID across reruns.
-- `actionMiddleware` discrimination relies on the function name string. Under
-  a JavaScript minifier with function-name mangling enabled (e.g. terser
-  without `keep_fnames`), auto-instrumentation will silently classify actions
-  as atoms. Configure your bundler to preserve the name, or extend targets
-  manually.
+- Trace context belongs to the Reatom execution stack. External callbacks need
+  `wrap(callback)` or a new explicit entry point; this package does not bridge
+  arbitrary third-party async context managers.
 
 ## Node / non-browser usage
 
@@ -369,18 +515,18 @@ const otel = reatomOpentelemetry({
   serviceName: 'my-cli',
   version: '1.0.0',
 })
-process.on('beforeExit', async () => {
+try {
+  // Create and run the application while tracing is installed.
+  await wrap(import('./main.ts'))
+} finally {
   await otel.flush()
   otel.dispose()
-})
+}
 ```
 
 ## Caveats for authenticated collectors
 
-- Leave `useBeacon` at its default (`false`). Beacon cannot send custom
-  headers, and a JSON `Content-Type` triggers an unload-time CORS preflight
-  that the browser will silently drop.
-- Provide `headers: { Authorization: '...' }`.
-- The unload flush uses `fetch({ keepalive: true })`, which the browser
-  holds open past teardown and which carries your headers. There is a
-  ~64 KB keepalive budget per origin — large unload bursts may still drop.
+- Leave `useBeacon` at its default (`false`); beacon cannot send custom headers.
+- Provide `headers: { Authorization: '...' }` and configure collector CORS.
+- Unload fetch uses `keepalive: true` and the shared document budget described
+  above. Neither keepalive nor beacon guarantees delivery during page teardown.

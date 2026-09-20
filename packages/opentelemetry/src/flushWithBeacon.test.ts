@@ -1,8 +1,36 @@
 import { expect, test, vi } from 'vitest'
 
-import { flushWithBeacon } from './flushWithBeacon.ts'
+import { flushWithBeacon as sendSelected } from './flushWithBeacon.ts'
+import { selectUnloadBatch } from './selectUnloadBatch.ts'
 
 const makePayload = (spans: readonly unknown[]) => ({ resourceSpans: spans })
+
+// Keep the selection assertions against the common selector used by both IO paths.
+const flushWithBeacon = (input: {
+  endpoint: string
+  spans: readonly unknown[]
+  buildPayload: typeof makePayload
+  maxBeaconBytes?: number
+  sendBeacon?: (url: string, data: BodyInit) => boolean
+}) => {
+  const selected = selectUnloadBatch({
+    items: input.spans,
+    maxBytes: input.maxBeaconBytes ?? 60 * 1024,
+    encode: (span) =>
+      JSON.stringify(input.buildPayload([span]).resourceSpans[0]),
+  })
+  return {
+    accepted:
+      selected.keptCount === 0
+        ? input.spans.length === 0
+        : sendSelected({
+            endpoint: input.endpoint,
+            body: selected.body,
+            sendBeacon: input.sendBeacon,
+          }),
+    selectedCount: selected.keptCount,
+  }
+}
 
 const beaconMock = (result: boolean) =>
   vi.fn<(url: string, data: BodyInit) => boolean>(() => result)

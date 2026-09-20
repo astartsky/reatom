@@ -1,6 +1,7 @@
 import { action, atom, computed, context } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
+import type { CaptureValuesOptions } from './captureValues.ts'
 import type { ReatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 
@@ -21,7 +22,7 @@ interface Setup {
   fetchMock: ReturnType<typeof vi.fn>
   exported: WirePayload[]
 }
-const setup = () => {
+const setup = (captureValues?: CaptureValuesOptions) => {
   const exported: WirePayload[] = []
   const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
     exported.push(JSON.parse(String(init?.body)))
@@ -31,8 +32,24 @@ const setup = () => {
     endpoint: ENDPOINT,
     serviceName: 'guard-test',
     fetch: fetchMock,
+    captureValues,
   })
   return { otel, fetchMock, exported }
+}
+
+const captureProbe = (input: Record<string, unknown>) => {
+  const reads = { ownKeys: 0, descriptors: 0 }
+  const value = new Proxy(input, {
+    ownKeys(target) {
+      reads.ownKeys++
+      return Reflect.ownKeys(target)
+    },
+    getOwnPropertyDescriptor(target, key) {
+      reads.descriptors++
+      return Reflect.getOwnPropertyDescriptor(target, key)
+    },
+  })
+  return { value, reads }
 }
 
 /** Count Date.now/performance.now ticks during fn() only. */
@@ -58,24 +75,19 @@ const withClockCount = <T>(
 }
 
 test('positive control: active instrumentation observes clocks, capture and export', async () => {
-  let reads = 0
-  const payload = {
-    get value() {
-      reads++
-      return 'secret'
-    },
-  }
-  const { otel, fetchMock } = setup()
+  const { value: payload, reads } = captureProbe({ value: 'secret' })
+  const { otel, fetchMock } = setup({})
   try {
     const work = action(() => payload, 'work')
     context.start(() => {
       const run = withClockCount(() => work())
-      expect(run.result).toBe(payload)
+      expect(run.result === payload).toBe(true)
       // Positive control: with the adapter active, removal of instrumentation
       // cannot pass — clocks tick and capture reads the payload.
       expect(run.ticks).toBeGreaterThan(0)
       expect(run.ids).toBeGreaterThan(0)
-      expect(reads).toBe(1)
+      expect(reads.ownKeys).toBeGreaterThan(0)
+      expect(reads.descriptors).toBeGreaterThan(0)
     })
     await otel.flush()
     expect(fetchMock).toHaveBeenCalled()
@@ -86,42 +98,48 @@ test('positive control: active instrumentation observes clocks, capture and expo
 })
 
 test('after dispose: action call and atom.set preserve identity/state with zero clock, capture, export', async () => {
-  let reads = 0
-  const payload = {
-    get value() {
-      reads++
-      return 'secret'
+  const { value: payload, reads } = captureProbe({ value: 'secret' })
+  let captures = 0
+  const { otel, fetchMock } = setup({
+    redact(_key: string, value: unknown) {
+      captures++
+      return value
     },
-  }
-  const { otel, fetchMock } = setup()
+  })
   try {
     const work = action(() => payload, 'workAfterDispose')
     const counter = atom(0, 'guardCounter')
     context.start(() => {
-      expect(work()).toBe(payload)
+      expect(work() === payload).toBe(true)
+      const beforeSetter = captures
       expect(counter.set(1)).toBe(1)
+      expect(captures).toBeGreaterThan(beforeSetter)
     })
+    expect(reads.ownKeys).toBeGreaterThan(0)
+    expect(reads.descriptors).toBeGreaterThan(0)
     await otel.flush()
     expect(fetchMock).toHaveBeenCalled()
 
     otel.dispose()
     fetchMock.mockClear()
-    reads = 0
+    reads.ownKeys = reads.descriptors = 0
+    captures = 0
 
     context.start(() => {
       const run = withClockCount(() => work())
       // Return identity preserved...
-      expect(run.result).toBe(payload)
+      expect(run.result === payload).toBe(true)
       // ...but the observer is inert: no clock observation, no capture read.
       expect(run.ticks).toBe(0)
       expect(run.ids).toBe(0)
-      expect(reads).toBe(0)
+      expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
       // Atom write preserves state without observer activity.
       const update = withClockCount(() => counter.set(2))
       expect(update.result).toBe(2)
       expect(update.ticks).toBe(0)
       expect(update.ids).toBe(0)
     })
+    expect(captures).toBe(0)
     await otel.flush()
     expect(fetchMock).not.toHaveBeenCalled()
   } finally {
@@ -133,14 +151,8 @@ test('after dispose: action call and atom.set preserve identity/state with zero 
 for (const kind of ['action', 'computed'] as const) {
   for (const reject of [false, true]) {
     test(`${kind}: ${reject ? 'rejection' : 'fulfillment'} after disposal does not inspect or enqueue`, async () => {
-      const { otel, fetchMock } = setup()
-      let reads = 0
-      const value = {
-        get secret() {
-          reads++
-          return 'sentinel'
-        },
-      }
+      const { otel, fetchMock } = setup({})
+      const { value, reads } = captureProbe({ secret: 'sentinel' })
       let finish!: (value: unknown) => void
       const original = new Promise<unknown>((resolve, fail) => {
         finish = reject ? fail : resolve
@@ -150,10 +162,40 @@ for (const kind of ['action', 'computed'] as const) {
         (error) => ({ ok: false, value: error }),
       )
       try {
+        // Exercise the same kind and settlement with capture enabled before
+        // testing the disposal guard; safe capture never calls getters.
+        const live = Promise.withResolvers<unknown>()
+        const liveOutcome = live.promise.then(
+          (result) => ({ ok: true, value: result }),
+          (error) => ({ ok: false, value: error }),
+        )
+        const liveTarget =
+          kind === 'action'
+            ? action(() => live.promise, 'liveControl')
+            : computed(() => live.promise, 'liveControl')
+        expect(context.start(() => liveTarget()) === live.promise).toBe(true)
+        if (reject) live.reject(value)
+        else live.resolve(value)
+        const liveSettled = await liveOutcome
+        await Promise.resolve()
+        expect(liveSettled.ok).toBe(!reject)
+        expect(liveSettled.value === value).toBe(true)
+        expect(reads.ownKeys).toBeGreaterThan(0)
+        expect(reads.descriptors).toBeGreaterThan(0)
+        await otel.flush()
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        fetchMock.mockClear()
+        reads.ownKeys = reads.descriptors = 0
+
+        let calls = 0
+        const pending = () => {
+          calls++
+          return original
+        }
         const target =
           kind === 'action'
-            ? action(() => original, 'pending')
-            : computed(() => original, 'pending')
+            ? action(pending, 'pending')
+            : computed(pending, 'pending')
         // Start while active so completion, rather than the entry guard, is tested.
         context.start(() => {
           const start = withClockCount(() => target())
@@ -161,13 +203,16 @@ for (const kind of ['action', 'computed'] as const) {
           expect(start.ticks).toBeGreaterThan(0)
           expect(start.ids).toBeGreaterThan(0)
         })
+        expect(calls).toBe(1)
+        expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
         otel.dispose()
         finish(value)
         const settled = await outcome
         await Promise.resolve()
         expect(settled.ok).toBe(!reject)
-        expect(settled.value).toBe(value)
-        expect(reads).toBe(0)
+        expect(settled.value === value).toBe(true)
+        expect(calls).toBe(1)
+        expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
         await otel.flush()
         expect(fetchMock).not.toHaveBeenCalled()
       } finally {
@@ -177,29 +222,30 @@ for (const kind of ['action', 'computed'] as const) {
   }
 }
 
-test('after dispose: sync throw keeps error identity without error-field getter read', async () => {
-  let reads = 0
-  class Boom {
-    get message() {
-      reads++
-      return 'boom'
-    }
-  }
-  const { otel, fetchMock } = setup()
+test('after dispose: sync throw keeps error identity without error-field inspection', async () => {
+  const { value: boom, reads } = captureProbe({ message: 'boom' })
+  const { otel, fetchMock } = setup({})
   try {
-    const boom = new Boom()
     const fail = action(() => {
       throw boom
     }, 'failAfterDispose')
 
+    let activeError: unknown
     context.start(() => {
-      expect(() => fail()).toThrow()
+      try {
+        fail()
+      } catch (error) {
+        activeError = error
+      }
     })
+    expect(activeError === boom).toBe(true)
+    expect(reads.ownKeys).toBeGreaterThan(0)
+    expect(reads.descriptors).toBeGreaterThan(0)
     await otel.flush()
 
     otel.dispose()
     fetchMock.mockClear()
-    reads = 0
+    reads.ownKeys = reads.descriptors = 0
 
     let thrown: unknown
     context.start(() => {
@@ -213,11 +259,11 @@ test('after dispose: sync throw keeps error identity without error-field getter 
         }
       })
       expect(run.result).toBe('thrown')
-      expect(thrown).toBe(boom)
+      expect(thrown === boom).toBe(true)
       expect(run.ticks).toBe(0)
       expect(run.ids).toBe(0)
     })
-    expect(reads).toBe(0)
+    expect(reads).toEqual({ ownKeys: 0, descriptors: 0 })
     expect(fetchMock).not.toHaveBeenCalled()
   } finally {
     otel.dispose()

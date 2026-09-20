@@ -3,6 +3,8 @@ import { tracesUrl } from './tracesUrl.ts'
 export interface SendTracesInput {
   endpoint: string
   payload: unknown
+  /** Already serialized owned payload, including the measured unload envelope. */
+  body?: string
   /**
    * Auth and tenancy headers attached to every OTLP fetch. The OTLP wire
    * `Content-Type` is fixed to `application/json` and any user-supplied
@@ -12,8 +14,8 @@ export interface SendTracesInput {
   fetch?: typeof globalThis.fetch
   /**
    * Set on unload-triggered fetches so the browser holds the connection past
-   * page teardown (capped at 64 KB per origin). Off by default to avoid the cap
-   * on normal in-flight batches.
+   * page teardown. The browser shares a limited in-flight byte budget across
+   * keepalive requests. Off by default for ordinary batches.
    */
   keepalive?: boolean
   /** Aborts the in-flight fetch — used by `dispose()` to tear down cleanly. */
@@ -48,11 +50,14 @@ const buildHeaders = (
  */
 export const sendTraces = async (input: SendTracesInput): Promise<Response> => {
   const fetchImpl = input.fetch ?? globalThis.fetch
-  return fetchImpl(tracesUrl(input.endpoint), {
+  const url = tracesUrl(input.endpoint)
+  const init: RequestInit = {
     method: 'POST',
     headers: buildHeaders(input.headers),
-    body: JSON.stringify(input.payload),
+    body: input.body ?? JSON.stringify(input.payload),
     keepalive: input.keepalive,
     signal: input.signal,
-  })
+  }
+  input.signal?.throwIfAborted()
+  return fetchImpl(url, init)
 }

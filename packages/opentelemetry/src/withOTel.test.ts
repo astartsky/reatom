@@ -9,9 +9,7 @@ import {
 import { expect, test, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
-import { spanIdVar } from './spanIdVar.ts'
 import { HEX_SPAN_ID, HEX_TRACE_ID } from './test-helpers.ts'
-import { traceIdVar } from './traceIdVar.ts'
 import { createTestWithOTel } from './test-helpers.ts'
 
 const collectSpans = () => {
@@ -24,7 +22,11 @@ const collectSpans = () => {
 
 test('async action instrumentation survives minified core middleware names', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
   const originalName = actionMiddleware.name
   try {
     Object.defineProperty(actionMiddleware, 'name', { value: 'a' })
@@ -43,7 +45,11 @@ test('async action instrumentation survives minified core middleware names', asy
 
 test('sync action records a span with name, params, payload, and unset status', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const greet = action((name: string) => `hi ${name}`, 'greet').extend(
     withOTel(),
@@ -106,7 +112,11 @@ test('nested actions share traceId; inner span has parentSpanId pointing at the 
 
 test('async action records span when the promise resolves with unset status', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const fetchData = action(async () => {
     await wrap(sleep(0))
@@ -125,7 +135,11 @@ test('async action records span when the promise resolves with unset status', as
 
 test('async action records span with error status when the promise rejects', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const broken = action(async () => {
     throw new Error('boom')
@@ -143,7 +157,11 @@ test('async action records span with error status when the promise rejects', asy
 
 test('synchronous throw in an action records error span and rethrows', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const broken = action((): number => {
     throw new Error('bad')
@@ -160,22 +178,27 @@ test('synchronous throw in an action records error span and rethrows', () => {
   })
 })
 
-// OTel semantic conventions for exceptions: an error span SHOULD carry a
-// span event named "exception" with exception.type / .message / .stacktrace
-// and exception.escaped=true when the exception leaves the span scope.
-// Without this, dashboards lose stack traces — `status.message` is just a
-// flat serialize(error), no frame data.
-// https://opentelemetry.io/docs/specs/semconv/exceptions/exception-spans/
+// Message and data-property stack capture require explicit opt-in. Native
+// lazy stack accessors must not be evaluated by descriptor-only observation.
 test('async action rejection emits an `exception` event per OTel semconv', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
+  const failure = new TypeError('boom')
+  Object.defineProperty(failure, 'stack', {
+    value: 'captured-stack: boom at async-action',
+    configurable: true,
+  })
 
   const broken = action(async () => {
-    throw new TypeError('boom')
+    throw failure
   }, 'broken').extend(withOTel())
 
   await context.start(async () => {
-    await expect(broken()).rejects.toThrow('boom')
+    await expect(broken()).rejects.toBe(failure)
   })
 
   expect(spans).toHaveLength(1)
@@ -184,52 +207,81 @@ test('async action rejection emits an `exception` event per OTel semconv', async
   expect(event.name).toBe('exception')
   expect(event.attributes!['exception.type']).toBe('TypeError')
   expect(event.attributes!['exception.message']).toBe('boom')
-  expect(event.attributes!['exception.stacktrace']).toEqual(
-    expect.stringContaining('boom'),
+  expect(event.attributes!['exception.stacktrace']).toBe(
+    'captured-stack: boom at async-action',
   )
-  expect(event.attributes!['exception.escaped']).toBe(true)
+  expect(Object.hasOwn(event.attributes!, 'exception.escaped')).toBe(false)
   expect(event.timeMs).toBeGreaterThanOrEqual(spans[0]!.startTimeMs)
   expect(event.timeMs).toBeLessThanOrEqual(spans[0]!.endTimeMs)
 })
 
-test('sync action throw emits an `exception` event', () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+test.each([undefined, {}])(
+  'sync action throw emits an `exception` event with captureValues=%j',
+  (
+    captureValues: Parameters<typeof createTestWithOTel>[0]['captureValues'],
+  ) => {
+    const { spans, queueSpan } = collectSpans()
+    const withOTel = createTestWithOTel({
+      queueSpan,
+      isActive: () => true,
+      captureValues,
+    })
+    const failure = new RangeError('out')
 
-  const broken = action((): number => {
-    throw new RangeError('out')
-  }, 'broken').extend(withOTel())
+    const broken = action((): number => {
+      throw failure
+    }, 'broken').extend(withOTel())
 
-  context.start(() => {
-    expect(() => broken()).toThrow('out')
-  })
+    let caught: unknown
+    context.start(() => {
+      try {
+        broken()
+      } catch (error) {
+        caught = error
+      }
+    })
 
-  const event = spans[0]!.events![0]!
-  expect(event.name).toBe('exception')
-  expect(event.attributes!['exception.type']).toBe('RangeError')
-  expect(event.attributes!['exception.message']).toBe('out')
-})
+    expect(caught).toBe(failure)
+    expect(spans).toHaveLength(1)
+    const event = spans[0]!.events![0]!
+    expect(event.name).toBe('exception')
+    expect(event.attributes!['exception.type']).toBe('RangeError')
+    if (captureValues) {
+      expect(event.attributes!['exception.message']).toBe('out')
+    } else {
+      expect(event.attributes).toEqual({ 'exception.type': 'RangeError' })
+      expect(spans[0]!.status).toEqual({ code: 'error' })
+    }
+    expect(Object.hasOwn(event.attributes!, 'exception.escaped')).toBe(false)
+  },
+)
 
 test('AbortError is control flow — no `exception` event emitted', async () => {
   const { spans, queueSpan } = collectSpans()
   const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const failure = new DOMException('private-abort-reason', 'AbortError')
 
   const aborted = action(async () => {
-    throw new DOMException('Aborted', 'AbortError')
+    throw failure
   }, 'aborted').extend(withOTel())
 
   await context.start(async () => {
-    await expect(aborted()).rejects.toThrow()
+    await expect(aborted()).rejects.toBe(failure)
   })
 
   expect(spans).toHaveLength(1)
   expect(spans[0]!.status).toBeUndefined()
   expect(spans[0]!.events ?? []).toEqual([])
+  expect(spans[0]!.attributes).toEqual({ payload: '[AbortError]' })
 })
 
 test('non-Error throw still records exception event with sane defaults', async () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const broken = action(async () => {
     throw 'string-throw'
@@ -245,11 +297,16 @@ test('non-Error throw still records exception event with sane defaults', async (
   expect(event.attributes!['exception.message']).toBe('string-throw')
   // No stacktrace available for non-Error throws — skip attribute, don't lie.
   expect(event.attributes!).not.toHaveProperty('exception.stacktrace')
+  expect(Object.hasOwn(event.attributes!, 'exception.escaped')).toBe(false)
 })
 
 test('atom records a span with prev/next state on setter call', () => {
   const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
+  })
 
   const counter = atom(0, 'counter').extend(withOTel())
 
@@ -263,30 +320,6 @@ test('atom records a span with prev/next state on setter call', () => {
   )
   expect(transition).toBeDefined()
   expect(transition!.name).toBe('counter')
-})
-
-test('inside an entry-point spawn, the var is seeded once and reused across siblings', () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-
-  const a = action(() => 'a', 'a').extend(withOTel())
-  const b = action(() => 'b', 'b').extend(withOTel())
-
-  context.start(() => {
-    traceIdVar.spawn(() => {
-      spanIdVar.spawn(() => {
-        a()
-      })
-    })
-    traceIdVar.spawn(() => {
-      spanIdVar.spawn(() => {
-        b()
-      })
-    })
-  })
-
-  expect(spans).toHaveLength(2)
-  expect(spans[0]!.traceId).not.toBe(spans[1]!.traceId)
 })
 
 test('bare sibling actions in the same context.start get distinct traces', () => {
@@ -401,7 +434,7 @@ test('an async action followed by a sync sibling does not adopt the async one as
 })
 
 // Codifies that `wrap()` preserves the reactive frame across `await`, so a
-// child action invoked AFTER the await still sees the parent's traceIdVar
+// child action invoked AFTER the await still sees the parent's execution context
 // and inherits the trace. A future change to @reatom/core's frame
 // propagation that breaks this would silently fragment async traces.
 test('child action invoked after `await wrap(...)` inherits the parent trace', async () => {

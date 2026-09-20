@@ -21,12 +21,13 @@ test('capacity includes in-flight records and export is single-flight', async ()
     context.start(() => {
       for (let i = 0; i < 12; i++) expect(work()).toBe(42)
     })
-    expect(fetch).toHaveBeenCalledTimes(1)
     expect(otel.stats()).toMatchObject({
       inFlight: 1,
       queued: 1,
       droppedByReason: { capacity: 10 },
     })
+    await Promise.resolve()
+    expect(fetch).toHaveBeenCalledTimes(1)
   } finally {
     otel.dispose()
     for (const resolve of pending) resolve(new Response(null))
@@ -373,6 +374,7 @@ test('admission precedes traversal and long application promises hold bounded ca
   const payloads: unknown[] = []
   const otel = reatomOpentelemetry({
     ...base,
+    captureValues: {},
     maxQueueSize: 1,
     fetch: async (_url, init) => {
       payloads.push(JSON.parse(init!.body as string))

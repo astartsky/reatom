@@ -10,33 +10,38 @@ interface WirePayload {
 }
 
 test('poisoned then cancelling its reservation must not capture on late settlement', async () => {
-  const fetchMock = vi.fn(
-    async (_url: unknown, _init?: RequestInit) =>
-      new Response(null, { status: 200 }),
+  const fetchMock = vi.fn<typeof globalThis.fetch>(
+    async () => new Response(null, { status: 200 }),
   )
   const otel = reatomOpentelemetry({
     endpoint: 'http://collector.invalid',
     serviceName: 'test',
+    captureValues: {},
     maxQueueSize: 1,
     maxBatchSize: 1,
     retry: { maxRetries: 0 },
     fetch: fetchMock,
   })
   try {
-    // Positive capture control: the current serializer reads an enumerable
-    // getter on a live span payload, and the export completes cleanly.
+    // Positive capture control: a live span traverses data descriptors and
+    // exports. Getter counters would stay zero even with capture enabled.
     let liveReads = 0
-    const liveValue = {}
-    Object.defineProperty(liveValue, 'v', {
-      enumerable: true,
-      get() {
-        liveReads++
-        return 1
+    const liveValue = new Proxy(
+      { v: 1 },
+      {
+        ownKeys(target) {
+          liveReads++
+          return Reflect.ownKeys(target)
+        },
+        getOwnPropertyDescriptor(target, key) {
+          liveReads++
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
       },
-    })
+    )
     const live = action(() => liveValue, 'liveCaptureControl')
     context.start(() => {
-      expect(live()).toBe(liveValue)
+      expect(live() === liveValue).toBe(true)
     })
     expect(liveReads).toBeGreaterThan(0)
     await otel.flush()
@@ -56,14 +61,19 @@ test('poisoned then cancelling its reservation must not capture on late settleme
     const { promise: native, resolve: resolveNative } =
       Promise.withResolvers<unknown>()
     let lateReads = 0
-    const lateValue = {}
-    Object.defineProperty(lateValue, 'v', {
-      enumerable: true,
-      get() {
-        lateReads++
-        return 1
+    const lateValue = new Proxy(
+      { v: 1 },
+      {
+        ownKeys(target) {
+          lateReads++
+          return Reflect.ownKeys(target)
+        },
+        getOwnPropertyDescriptor(target, key) {
+          lateReads++
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
       },
-    })
+    )
 
     let observation!: Promise<unknown>
     const sentinel = new Error('then registration failure')
