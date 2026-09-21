@@ -66,7 +66,9 @@ const emptyDrops = (): Record<DropReason, number> => ({
 const report = (callback: () => void) => {
   try {
     callback()
-  } catch {}
+  } catch {
+    // A diagnostic callback cannot interrupt the queue transition.
+  }
 }
 
 /** Holds capacity until a reservation or its transport lease reaches an outcome. */

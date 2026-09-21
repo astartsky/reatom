@@ -1,13 +1,7 @@
 import { isRec } from '@reatom/core'
 
-import { toOtlpArrayValue } from './toOtlpArrayValue.ts'
-import { toOtlpBoolValue } from './toOtlpBoolValue.ts'
+import { nonFiniteString } from './nonFiniteString.ts'
 import { toOtlpBytesValue } from './toOtlpBytesValue.ts'
-import type { OtlpDoubleValue } from './toOtlpDoubleValue.ts'
-import { toOtlpDoubleValue } from './toOtlpDoubleValue.ts'
-import { toOtlpIntValue } from './toOtlpIntValue.ts'
-import { toOtlpKvListValue } from './toOtlpKvListValue.ts'
-import { toOtlpStringValue } from './toOtlpStringValue.ts'
 
 export type OtlpAttrValue =
   | string
@@ -28,10 +22,26 @@ export type OtlpAnyValue =
   | { kvlistValue: { values: { key: string; value: OtlpAnyValue }[] } }
   | { bytesValue: string }
 
+type OtlpDoubleValue = {
+  doubleValue: number | 'NaN' | 'Infinity' | '-Infinity'
+}
+
 const CIRCULAR: OtlpAnyValue = { stringValue: '[Circular]' }
 
 const INT64_MAX = (1n << 63n) - 1n //  9_223_372_036_854_775_807n
 const INT64_MIN = -(1n << 63n) //     -9_223_372_036_854_775_808n
+
+const toOtlpStringValue = (value: string) => ({ stringValue: value })
+
+const toOtlpIntValue = (value: number | bigint) => ({
+  intValue: String(value),
+})
+
+const toOtlpBoolValue = (value: boolean) => ({ boolValue: value })
+
+const toOtlpDoubleValue = (value: number): OtlpDoubleValue => ({
+  doubleValue: nonFiniteString(value) ?? value,
+})
 
 // Ancestor-stack cycle detection: add on enter, remove on exit so shared-but-
 // non-cyclic references like { a: x, b: x } aren't false-flagged as cycles.
@@ -60,17 +70,20 @@ export const encodeOtlpValue = (
   if (Array.isArray(value)) {
     if (seen.has(value)) return CIRCULAR
     seen.add(value)
-    const result = toOtlpArrayValue(value, seen)
+    const result = {
+      arrayValue: { values: value.map((item) => encodeOtlpValue(item, seen)) },
+    }
     seen.delete(value)
     return result
   }
   if (isRec(value)) {
     if (seen.has(value)) return CIRCULAR
     seen.add(value)
-    const result = toOtlpKvListValue(
-      value as Record<string, OtlpAttrValue>,
-      seen,
-    )
+    const result = {
+      kvlistValue: {
+        values: encodeAttributes(value as Record<string, OtlpAttrValue>, seen),
+      },
+    }
     seen.delete(value)
     return result
   }
@@ -79,3 +92,24 @@ export const encodeOtlpValue = (
 
 export const toOtlpValue = (value: OtlpAttrValue): OtlpAnyValue =>
   encodeOtlpValue(value, new WeakSet())
+
+// null/undefined keys are dropped: a concrete {stringValue: 'null'} attribute
+// pollutes backend searches and aggregations by blurring absence with real
+// string data. Per OTel common spec, empty-string / zero / empty-array are
+// meaningful and preserved; only nullish is considered "no value".
+const encodeAttributes = (
+  record: Record<string, OtlpAttrValue> | undefined,
+  seen: WeakSet<object>,
+): { key: string; value: OtlpAnyValue }[] => {
+  if (!record) return []
+  const result: { key: string; value: OtlpAnyValue }[] = []
+  for (const [key, value] of Object.entries(record)) {
+    if (value === null || value === undefined) continue
+    result.push({ key, value: encodeOtlpValue(value, seen) })
+  }
+  return result
+}
+
+export const toOtlpAttributes = (
+  record: Record<string, OtlpAttrValue> | undefined,
+) => encodeAttributes(record, new WeakSet())

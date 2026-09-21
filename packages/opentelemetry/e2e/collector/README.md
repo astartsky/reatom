@@ -4,7 +4,8 @@ This separate suite runs the original tree, tic-tac-toe and React search
 applications as minified production builds. A test bootstrap creates the
 adapter before importing each original entrypoint. All framework imports
 resolve to the same built `@reatom/core`; the build records and checks that
-resolution. Application models, components and the core are not patched.
+resolution. The harness does not rewrite application models, components or the
+core.
 
 The assertions cover the adapter's actions-only contract:
 

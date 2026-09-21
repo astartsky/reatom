@@ -2,6 +2,7 @@ import type { AtomLike, Fn, GenericExt } from '@reatom/core'
 import { isAction, withActionMiddleware } from '@reatom/core'
 
 import type { SpanInput, SpanKind } from './buildSpan.ts'
+import { MAX_RECORD_BYTES } from './buildSpan.ts'
 import type { SpanEventInput } from './buildSpanEvent.ts'
 import {
   type CaptureValuesOptions,
@@ -68,7 +69,7 @@ export const createWithOTel = ({
     const parent = storage.read()
     const reservation = observe(reserveSpan)
     if (!reservation) return
-    if (name.length > 16_384) {
+    if (name.length > MAX_RECORD_BYTES) {
       observe(() => reservation.cancel('oversized'))
       return
     }

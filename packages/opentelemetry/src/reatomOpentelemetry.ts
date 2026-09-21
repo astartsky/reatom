@@ -9,10 +9,9 @@ import {
   STACK,
 } from '@reatom/core'
 
-import { buildExportPayload } from './buildExportPayload.ts'
-import { buildResource } from './buildResource.ts'
+import { buildExportPayload, buildResource } from './buildExportPayload.ts'
 import type { OtlpSpan, SpanInput } from './buildSpan.ts'
-import { buildSpan } from './buildSpan.ts'
+import { buildSpan, MAX_RECORD_BYTES } from './buildSpan.ts'
 import { createValueCapture } from './captureValues.ts'
 import type { Reservation, TelemetryStats } from './createBatchQueue.ts'
 import { createBatchQueue } from './createBatchQueue.ts'
@@ -31,7 +30,6 @@ import type { OtlpAttrValue } from './toOtlpValue.ts'
 import { availableUnloadBytes, reserveUnloadBytes } from './unloadBudget.ts'
 import { createWithOTel } from './withOTel.ts'
 
-const MAX_RECORD_BYTES = 16_384
 const encoder = new TextEncoder()
 
 const resourceSnapshot = (
@@ -48,40 +46,24 @@ const resourceSnapshot = (
   return snapshot
 }
 
-// Type-aware stable serializer for resource-attribute grouping. JSON.stringify
-// is unsafe here: it throws on bigint and emits non-canonical "{0:1,1:2,...}"
-// for Uint8Array, conflating distinct byte sequences and crashing the flush.
-// Ancestor-stack cycle detection mirrors toOtlpValue so a self-referencing
-// attribute crashes neither the wire payload nor the grouping pass.
-const stableKey = (
-  value: OtlpAttrValue | null | undefined,
-  seen?: WeakSet<object>,
-): string => {
+// Capture has already bounded, copied and removed cycles from these values.
+// Sort object keys for grouping while preserving distinctions between types.
+const stableKey = (value: OtlpAttrValue | null | undefined): string => {
   if (value === null || value === undefined) return 'x'
   if (typeof value === 'string') return 's' + JSON.stringify(value)
   if (typeof value === 'number') return 'n' + String(value)
   if (typeof value === 'bigint') return 'B' + value.toString()
   if (typeof value === 'boolean') return value ? 'b1' : 'b0'
   if (value instanceof Uint8Array) return 'U' + hexFromBytes(value)
-  seen ??= new WeakSet()
-  if (Array.isArray(value)) {
-    if (seen.has(value)) return 'C'
-    seen.add(value)
-    const result = 'A[' + value.map((v) => stableKey(v, seen)).join(',') + ']'
-    seen.delete(value)
-    return result
-  }
-  if (seen.has(value)) return 'C'
-  seen.add(value)
-  const keys = Object.keys(value).sort()
-  const result =
+  if (Array.isArray(value)) return 'A[' + value.map(stableKey).join(',') + ']'
+  return (
     'O{' +
-    keys
-      .map((k) => JSON.stringify(k) + ':' + stableKey(value[k], seen))
+    Object.keys(value)
+      .sort()
+      .map((key) => JSON.stringify(key) + ':' + stableKey(value[key]))
       .join(',') +
     '}'
-  seen.delete(value)
-  return result
+  )
 }
 
 export interface ReatomOpentelemetryInput {
@@ -108,8 +90,6 @@ export interface ReatomOpentelemetryInput {
   maxQueueSize?: number
   /** Budget for each batch export and, separately, each flush caller. */
   exportTimeoutMs?: number
-  /** Optional lower beacon limit within the shared 60 KiB document budget. */
-  maxBeaconBytes?: number
   /**
    * Opt-in to `navigator.sendBeacon` for unload-time delivery. Default:
    * `false`.
@@ -231,13 +211,10 @@ export const reatomOpentelemetry = (
         version,
       })),
     })
-  const selectUnload = (items: readonly QueueItem[], beacon = false) =>
+  const selectUnload = (items: readonly QueueItem[]) =>
     selectUnloadBatch({
       items,
-      maxBytes: Math.min(
-        availableUnloadBytes(pageDocument!),
-        beacon ? (input.maxBeaconBytes ?? Infinity) : Infinity,
-      ),
+      maxBytes: availableUnloadBytes(pageDocument!),
       // One complete ResourceSpans group per record allows exact linear sizing.
       encode: (item) => JSON.stringify(payload([item]).resourceSpans[0]),
     })
@@ -403,7 +380,7 @@ export const reatomOpentelemetry = (
     let keptCount = lease.items.length
     let excluded = 0
     try {
-      const selected = selectUnload(lease.items, true)
+      const selected = selectUnload(lease.items)
       keptCount = selected.keptCount
       excluded = selected.droppedCount
       if (keptCount === 0) {

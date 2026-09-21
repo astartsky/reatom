@@ -493,15 +493,15 @@ test.each(['accepted', 'refused', 'throw'] as const)(
     const otel = reatomOpentelemetry({
       ...base,
       maxBatchSize: 10,
-      maxBeaconBytes: 5000,
       useBeacon: true,
       sendBeacon,
       fetch,
     })
     try {
-      // One 4 KiB name fits; two cannot fit in the 5 KiB envelope budget.
-      const names = ['oldest', 'middle', 'newest'].map(
-        (name) => name + 'x'.repeat(4096),
+      // Four records fit the shared 60 KiB budget; the oldest fifth does not.
+      const names = Array.from(
+        { length: 5 },
+        (_, i) => `record-${i}-` + 'x'.repeat(14_000),
       )
       context.start(() => {
         for (const name of names) action(() => 42, name)()
@@ -512,20 +512,24 @@ test.each(['accepted', 'refused', 'throw'] as const)(
       expect(sendBeacon).toHaveBeenCalledTimes(1)
       expect(fetch).not.toHaveBeenCalled()
       const blob = sendBeacon.mock.calls[0]![1] as Blob
-      expect(blob.size).toBeLessThanOrEqual(5000)
+      expect(blob.size).toBeLessThanOrEqual(60 * 1024)
       const body = JSON.parse(await blob.text())
-      const spans = body.resourceSpans[0].scopeSpans[0].spans
-      expect(spans).toHaveLength(1)
-      expect(spans[0].name).toBe(names[2])
+      const spans = body.resourceSpans.flatMap(
+        (resource: { scopeSpans: { spans: { name: string }[] }[] }) =>
+          resource.scopeSpans.flatMap((scope) => scope.spans),
+      )
+      expect(spans.map((span: { name: string }) => span.name)).toEqual(
+        names.slice(1),
+      )
       expect(otel.stats()).toMatchObject({
         queued: 0,
         inFlight: 0,
         exported: 0,
-        beaconAccepted: outcome === 'accepted' ? 1 : 0,
-        dropped: outcome === 'accepted' ? 2 : 3,
+        beaconAccepted: outcome === 'accepted' ? 4 : 0,
+        dropped: outcome === 'accepted' ? 1 : 5,
         droppedByReason: {
-          oversized: 2,
-          export: outcome === 'accepted' ? 0 : 1,
+          oversized: 1,
+          export: outcome === 'accepted' ? 0 : 4,
         },
       })
       emit()

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { createBatchQueue } from './createBatchQueue.ts'
 import type { BatchOutcome } from './createBatchQueue.ts'
+import { createBatchQueue } from './createBatchQueue.ts'
 import { createExportWorker } from './createExportWorker.ts'
 
 beforeEach(() => vi.useFakeTimers())

@@ -5,8 +5,8 @@ import { buildSpanStatus } from './buildSpanStatus.ts'
 import type { SpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
 import { msToNano } from './msToNano.ts'
-import { toOtlpAttributes } from './toOtlpAttributes.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
+import { toOtlpAttributes } from './toOtlpValue.ts'
 
 // OTLP enum values must be integers, not name strings.
 // https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
@@ -17,6 +17,8 @@ const SPAN_KIND = {
   producer: 4,
   consumer: 5,
 } as const
+
+export const MAX_RECORD_BYTES = 16_384
 
 export type SpanKind = keyof typeof SPAN_KIND
 

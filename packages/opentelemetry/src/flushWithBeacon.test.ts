@@ -1,145 +1,57 @@
 import { expect, test, vi } from 'vitest'
 
-import { flushWithBeacon as sendSelected } from './flushWithBeacon.ts'
-import { selectUnloadBatch } from './selectUnloadBatch.ts'
+import { flushWithBeacon } from './flushWithBeacon.ts'
 
-const makePayload = (spans: readonly unknown[]) => ({ resourceSpans: spans })
-
-// Keep the selection assertions against the common selector used by both IO paths.
-const flushWithBeacon = (input: {
-  endpoint: string
-  spans: readonly unknown[]
-  buildPayload: typeof makePayload
-  maxBeaconBytes?: number
-  sendBeacon?: (url: string, data: BodyInit) => boolean
-}) => {
-  const selected = selectUnloadBatch({
-    items: input.spans,
-    maxBytes: input.maxBeaconBytes ?? 60 * 1024,
-    encode: (span) =>
-      JSON.stringify(input.buildPayload([span]).resourceSpans[0]),
-  })
-  return {
-    accepted:
-      selected.keptCount === 0
-        ? input.spans.length === 0
-        : sendSelected({
-            endpoint: input.endpoint,
-            body: selected.body,
-            sendBeacon: input.sendBeacon,
-          }),
-    selectedCount: selected.keptCount,
-  }
-}
-
-const beaconMock = (result: boolean) =>
-  vi.fn<(url: string, data: BodyInit) => boolean>(() => result)
-
-test('posts JSON Blob to endpoint via sendBeacon', () => {
-  const sendBeacon = beaconMock(true)
-  const ok = flushWithBeacon({
-    endpoint: 'https://collector.example.com',
-    spans: [{ name: 'a' }, { name: 'b' }],
-    buildPayload: makePayload,
-    sendBeacon,
-  })
-  expect(ok).toEqual({ accepted: true, selectedCount: 2 })
+test('posts the selected JSON unchanged as an application/json Blob', async () => {
+  const body = JSON.stringify({ resourceSpans: [{ name: 'привет' }] })
+  const sendBeacon = vi.fn<(url: string, data: BodyInit) => boolean>(() => true)
+  expect(
+    flushWithBeacon({
+      endpoint: 'https://collector.example/',
+      body,
+      sendBeacon,
+    }),
+  ).toBe(true)
   expect(sendBeacon).toHaveBeenCalledTimes(1)
   const [url, blob] = sendBeacon.mock.calls[0]!
-  expect(url).toBe('https://collector.example.com/v1/traces')
+  expect(url).toBe('https://collector.example/v1/traces')
   expect(blob).toBeInstanceOf(Blob)
   expect((blob as Blob).type).toBe('application/json')
+  expect(await (blob as Blob).text()).toBe(body)
 })
 
-test('Blob body encodes the built payload', async () => {
-  const sendBeacon = beaconMock(true)
-  flushWithBeacon({
-    endpoint: 'https://c.example/',
-    spans: [{ name: 'a' }],
-    buildPayload: makePayload,
-    sendBeacon,
-  })
-  const blob = sendBeacon.mock.calls[0]![1] as Blob
-  const text = await blob.text()
-  expect(JSON.parse(text)).toEqual({ resourceSpans: [{ name: 'a' }] })
-})
+test.each(['refused', 'throw'] as const)(
+  'returns false when beacon is %s',
+  (outcome: 'refused' | 'throw') => {
+    const sendBeacon = vi.fn(() => {
+      if (outcome === 'throw') throw new Error('unavailable')
+      return false
+    })
+    expect(
+      flushWithBeacon({
+        endpoint: 'https://collector.example',
+        body: '{}',
+        sendBeacon,
+      }),
+    ).toBe(false)
+    expect(sendBeacon).toHaveBeenCalledTimes(1)
+  },
+)
 
-test('returns false when sendBeacon returns false', () => {
-  const sendBeacon = beaconMock(false)
-  const ok = flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans: [{ name: 'a' }],
-    buildPayload: makePayload,
-    sendBeacon,
-  })
-  expect(ok.accepted).toBe(false)
-})
-
-test('returns true and skips sendBeacon when spans are empty', () => {
-  const sendBeacon = beaconMock(true)
-  const ok = flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans: [],
-    buildPayload: makePayload,
-    sendBeacon,
-  })
-  expect(ok.accepted).toBe(true)
+test('skips transport for an empty selection', () => {
+  const sendBeacon = vi.fn(() => true)
+  expect(
+    flushWithBeacon({
+      endpoint: 'https://collector.example',
+      body: '',
+      sendBeacon,
+    }),
+  ).toBe(true)
   expect(sendBeacon).not.toHaveBeenCalled()
 })
 
-test('truncates oldest spans until payload fits maxBeaconBytes', () => {
-  const sendBeacon = beaconMock(true)
-  const spans = Array.from({ length: 5 }, (_, i) => ({ name: `span-${i}` }))
-  flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans,
-    buildPayload: makePayload,
-    maxBeaconBytes: 60,
-    sendBeacon,
-  })
-  const blob = sendBeacon.mock.calls[0]![1] as Blob
-  expect(blob.size).toBeLessThanOrEqual(60)
-})
-
-test('truncation keeps newest spans and drops oldest', async () => {
-  const sendBeacon = beaconMock(true)
-  const spans = [{ name: 'oldest' }, { name: 'middle' }, { name: 'newest' }]
-  const result = flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans,
-    buildPayload: makePayload,
-    maxBeaconBytes: 50,
-    sendBeacon,
-  })
-  const blob = sendBeacon.mock.calls[0]![1] as Blob
-  const text = await blob.text()
-  const parsed = JSON.parse(text) as { resourceSpans: { name: string }[] }
-  expect(parsed.resourceSpans.map((s) => s.name)).toEqual(['newest'])
-  expect(result).toEqual({ accepted: true, selectedCount: 1 })
-})
-
-test('returns false without calling sendBeacon when even one span exceeds limit', () => {
-  const sendBeacon = beaconMock(true)
-  const spans = [{ name: 'x'.repeat(100) }]
-  const ok = flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans,
-    buildPayload: makePayload,
-    maxBeaconBytes: 10,
-    sendBeacon,
-  })
-  expect(ok.accepted).toBe(false)
-  expect(sendBeacon).not.toHaveBeenCalled()
-})
-
-// Browsers/SSR/JSDOM where the API is unavailable: must return false rather
-// than dereference `navigator.sendBeacon.bind(navigator)` and throw.
-test('returns false (no throw) when navigator.sendBeacon is unavailable', () => {
-  const ok = flushWithBeacon({
-    endpoint: 'https://c.example',
-    spans: [{ name: 'a' }],
-    buildPayload: makePayload,
-    // Intentionally no `sendBeacon` injection; navigator is undefined here.
-  })
-  expect(ok.accepted).toBe(false)
+test('returns false when the browser API is unavailable', () => {
+  expect(
+    flushWithBeacon({ endpoint: 'https://collector.example', body: '{}' }),
+  ).toBe(false)
 })

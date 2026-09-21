@@ -5,6 +5,9 @@ actions, batches spans, and ships them to any
 [OTLP/HTTP JSON](https://opentelemetry.io/docs/specs/otlp/#otlphttp) collector.
 No OpenTelemetry SDK dependency or changes to `@reatom/core`.
 
+The [counter example](./examples/README.md) shows synchronous actions and
+explicit context restoration after an await.
+
 ## Install
 
 ```sh
@@ -165,7 +168,6 @@ reatomOpentelemetry({
   maxBatchSize?: number                              // default 100
   maxQueueSize?: number                              // default 1000
   exportTimeoutMs?: number                           // default 30000; separate batch and flush budgets
-  maxBeaconBytes?: number                            // optional lower beacon limit; shared budget is at most 60 KiB
   useBeacon?: boolean                                // default false; opt-in for same-origin collectors without auth headers
   retry?: {                                          // OTLP retry tuning; defaults: 3 retries, 1s base, 30s cap, full jitter
     maxRetries?: number
@@ -314,9 +316,7 @@ Other libraries share the browser's quota but are outside this counter, so the
 local headroom is not a delivery guarantee.
 
 `navigator.sendBeacon` is opt-in via `useBeacon: true` and cannot send custom
-auth headers. `maxBeaconBytes` can lower its per-request limit; it cannot raise
-the shared 60 KiB budget. Browser acceptance increments `beaconAccepted`, not
-`exported`. Refusal or an exception counts the selected records as export
+auth headers. Browser acceptance increments `beaconAccepted`, not `exported`. Refusal or an exception counts the selected records as export
 failures and releases their byte reservation.
 
 Selection encodes each considered owned record once, newest first. An
@@ -474,6 +474,28 @@ application Promise settles; disposal does not cancel it.
   and external callbacks need explicit `withContext` to retain an earlier
   parent. There is no automatic tracing of reactive computations or dependency
   links, and no bridge to third-party async context managers.
+
+## Testing
+
+From the workspace root:
+
+```sh
+pnpm --filter @reatom/opentelemetry lint
+pnpm --filter @reatom/opentelemetry test
+pnpm --filter @reatom/opentelemetry test:browser
+pnpm --filter @reatom/opentelemetry test:e2e:collector:oracle
+```
+
+The lint command uses the repository rules for the adapter, its tests, examples
+and E2E scripts. Generated bundles and run artifacts are excluded.
+
+The separate [Collector E2E guide](./e2e/collector/README.md) documents image and
+app-build preparation, execution and comparison of two clean runs. It tests
+minified applications with native Chromium transport and a pinned official
+Collector. Assertions cover application outcomes, exact delivered span IDs,
+parent relationships, errors, privacy, CORS and navigation delivery. Evidence
+and normalized graphs are retained outside source files; a failed or skipped
+prerequisite is never treated as a successful run.
 
 ## Node / non-browser usage
 

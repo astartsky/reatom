@@ -35,7 +35,6 @@ the resumed increment is a child of the action. `wrap` alone does not preserve
 the OpenTelemetry context; `withContext` is synchronous and restores its
 caller immediately, even when its callback returns a Promise.
 
-The earlier standalone `startTracing`/`createTracingExtension` implementation
-and writable ID variables have been replaced by the package API. There is no
-remote-parent or partial-ID setter. For application integrations, use
+This example belongs to the package and is separate from the original
+`examples/opentelemetry` implementation. For application integrations, use
 `otel.startTrace(name, callback)` and `otel.getCurrentContext()` directly.

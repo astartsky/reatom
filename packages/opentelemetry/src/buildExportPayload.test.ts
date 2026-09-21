@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
 
-import { buildExportPayload } from './buildExportPayload.ts'
+import { buildExportPayload, buildResource } from './buildExportPayload.ts'
 import { buildSpan } from './buildSpan.ts'
 import type { SpanId } from './generateSpanId.ts'
 import type { TraceId } from './generateTraceId.ts'
@@ -78,4 +78,30 @@ test('emits one resourceSpans entry per group with distinct resource attributes'
   expect(prodEntry).toBeDefined()
   expect(stagingEntry.scopeSpans[0]!.spans[0]!.name).toBe('a')
   expect(prodEntry.scopeSpans[0]!.spans[0]!.name).toBe('b')
+})
+
+test('builds empty resource attributes and owns the spans array', () => {
+  expect(buildResource({})).toEqual({ attributes: [] })
+  const spans = [makeSpan('owned')]
+  const result = buildExportPayload({
+    groups: [
+      {
+        resourceAttributes: { 'service.name': 'my-app' },
+        version: '1.0.0',
+        spans,
+      },
+    ],
+  })
+  spans.length = 0
+  expect(result.resourceSpans[0]).toMatchObject({
+    resource: {
+      attributes: [{ key: 'service.name', value: { stringValue: 'my-app' } }],
+    },
+    scopeSpans: [
+      {
+        scope: { name: '@reatom/opentelemetry', version: '1.0.0' },
+        spans: [{ name: 'owned' }],
+      },
+    ],
+  })
 })

@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest'
 
 import type { OtlpAttrValue } from './toOtlpValue.ts'
-import { toOtlpValue } from './toOtlpValue.ts'
+import { toOtlpAttributes, toOtlpValue } from './toOtlpValue.ts'
 
 test('dispatches string to stringValue', () => {
   expect(toOtlpValue('hello')).toEqual({ stringValue: 'hello' })
@@ -65,6 +65,33 @@ test('dispatches plain object to kvlistValue', () => {
   })
 })
 
+test('encodes attributes in source key order with their OTLP values', () => {
+  expect(
+    toOtlpAttributes({ 'service.name': 'app', count: 5, active: true }),
+  ).toEqual([
+    { key: 'service.name', value: { stringValue: 'app' } },
+    { key: 'count', value: { intValue: '5' } },
+    { key: 'active', value: { boolValue: true } },
+  ])
+})
+
+test('drops nullish attribute keys, including in nested maps', () => {
+  const input = {
+    dropped: undefined,
+    nested: { dropped: null, retained: 'x' },
+  } as unknown as Record<string, OtlpAttrValue>
+  expect(toOtlpAttributes(input)).toEqual([
+    {
+      key: 'nested',
+      value: {
+        kvlistValue: {
+          values: [{ key: 'retained', value: { stringValue: 'x' } }],
+        },
+      },
+    },
+  ])
+})
+
 test('dispatches NaN and Infinity to doubleValue as strings', () => {
   expect(toOtlpValue(NaN)).toEqual({ doubleValue: 'NaN' })
   expect(toOtlpValue(Infinity)).toEqual({ doubleValue: 'Infinity' })
@@ -72,10 +99,10 @@ test('dispatches NaN and Infinity to doubleValue as strings', () => {
 })
 
 test('integer-valued number above safe-int range routes to doubleValue (OTLP-aligned)', () => {
-  // JS already represents this as 9007199254740992 (precision lost at parse).
+  // Number conversion rounds this to 9007199254740992.
   // OTLP intValue is int64; emitting as doubleValue preserves the JS-level
   // truth without claiming int64 fidelity we cannot deliver.
-  expect(toOtlpValue(9007199254740993)).toEqual({
+  expect(toOtlpValue(Number('9007199254740993'))).toEqual({
     doubleValue: 9007199254740992,
   })
 })

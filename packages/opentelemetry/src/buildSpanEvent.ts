@@ -1,6 +1,6 @@
 import { msToNano } from './msToNano.ts'
-import { toOtlpAttributes } from './toOtlpAttributes.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
+import { toOtlpAttributes } from './toOtlpValue.ts'
 
 export interface SpanEventInput {
   name: string
