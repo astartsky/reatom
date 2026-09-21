@@ -22,6 +22,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:types": "tsc -p type-tests/tsconfig.json",
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "test:e2e:collector": "node e2e/collector/run.mjs",
     "test:e2e:collector:oracle": "node --test e2e/collector/*.test.mjs"

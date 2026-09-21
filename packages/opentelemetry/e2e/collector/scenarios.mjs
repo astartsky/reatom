@@ -662,8 +662,14 @@ const runOne = async ({
   return record
 }
 
-const runOffline = async ({ browser, origin, runId, artifactDirectory }) => {
-  const caseId = 'E06-offline'
+const runNoDelivery = async ({
+  browser,
+  origin,
+  runId,
+  artifactDirectory,
+  caseId,
+  query = '',
+}) => {
   const errors = []
   const { context, page, wireBodies, waitForWire } = await createPage(
     browser,
@@ -673,10 +679,9 @@ const runOffline = async ({ browser, origin, runId, artifactDirectory }) => {
   let ui
   let stats
   try {
-    await page.goto(
-      appUrl(origin, 'xo', 'traced', caseId, runId, '&offline=true'),
-      { waitUntil: 'domcontentloaded' },
-    )
+    await page.goto(appUrl(origin, 'xo', 'traced', caseId, runId, query), {
+      waitUntil: 'domcontentloaded',
+    })
     await page.waitForFunction(() => window.collectorTest?.ready === true)
     await cell(page, 0).click()
     ui = await snapshot(page)
@@ -813,72 +818,6 @@ const runPrivacyOptIn = async ({
   )
   if (errors.length)
     throw new Error(`${caseId}/traced failed: ${errors.join('\n')}`)
-  return record
-}
-
-const runDeniedCors = async ({ browser, origin, runId, artifactDirectory }) => {
-  const caseId = 'E06-cors-denied'
-  const deniedOrigin = origin.replace(/:4173$/, ':4174')
-  const errors = []
-  const { context, page, wireBodies, waitForWire } = await createPage(
-    browser,
-    errors,
-    [],
-  )
-  let ui
-  let stats
-  try {
-    await page.goto(appUrl(deniedOrigin, 'xo', 'traced', caseId, runId), {
-      waitUntil: 'domcontentloaded',
-    })
-    await page.waitForFunction(() => window.collectorTest?.ready === true)
-    await cell(page, 0).click()
-    ui = await snapshot(page)
-    assert.equal(ui.board[0], 'X')
-    assert.equal(ui.player, 'O')
-    // Playwright routing auto-fulfills preflight, including unmatched URLs.
-    // App fixtures are finished; disable interception before native OTLP.
-    await page.unrouteAll({ behavior: 'wait' })
-    stats = await controls(page, 'flush')
-    await waitForWire()
-    assertStats(stats, { deliveryExpected: false })
-    assert(
-      errors.every((error) =>
-        /collector|CORS|Failed to fetch|NetworkError/i.test(error),
-      ),
-      `unexpected browser diagnostics: ${errors.join('\n')}`,
-    )
-  } catch (error) {
-    errors.push(
-      error instanceof Error ? (error.stack ?? error.message) : String(error),
-    )
-  } finally {
-    await controls(page, 'dispose').catch(() => {})
-    await context.close()
-  }
-  const diagnostics = [...errors]
-  const unexpected = errors.filter(
-    (error) => !isExpectedDeliveryDiagnostic(error),
-  )
-  const record = {
-    caseId,
-    app: 'xo',
-    mode: 'traced',
-    wireBodies,
-    ui,
-    expectation: {},
-    errors: unexpected,
-    diagnostics,
-    deliveryExpected: false,
-    stats,
-  }
-  await mkdir(artifactDirectory, { recursive: true })
-  await writeFile(
-    join(artifactDirectory, `${caseId}-traced.json`),
-    JSON.stringify(record, null, 2) + '\n',
-  )
-  if (unexpected.length)
-    throw new Error(`${caseId}/traced failed: ${unexpected.join('\n')}`)
   return record
 }
 
@@ -1029,10 +968,25 @@ export const runScenarios = async ({
       await runPrivacyOptIn({ browser, origin, runId, artifactDirectory }),
     )
   if (!caseFilter || caseFilter.includes('E06-offline'))
-    cases.push(await runOffline({ browser, origin, runId, artifactDirectory }))
+    cases.push(
+      await runNoDelivery({
+        browser,
+        origin,
+        runId,
+        artifactDirectory,
+        caseId: 'E06-offline',
+        query: '&offline=true',
+      }),
+    )
   if (!caseFilter || caseFilter.includes('E06-cors-denied'))
     cases.push(
-      await runDeniedCors({ browser, origin, runId, artifactDirectory }),
+      await runNoDelivery({
+        browser,
+        origin: origin.replace(/:4173$/, ':4174'),
+        runId,
+        artifactDirectory,
+        caseId: 'E06-cors-denied',
+      }),
     )
   if (!caseFilter || caseFilter.includes('E06-unload-keepalive'))
     cases.push(

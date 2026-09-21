@@ -123,11 +123,13 @@ rewrite IDs already inherited by children.
 bridge or automatic remote-parent propagation. `resourceAttributesVar` remains
 a separate, shared ambient resource override.
 
-Telemetry callbacks use untracked reads so their dependencies do not become
-application dependencies. Reentrant actions invoked by telemetry callbacks are
-not traced. These callbacks can still initialize state or perform other
-application work; their effects are not rolled back. Keep filters and redaction
-observational.
+Filters and capture callbacks use untracked reads so their dependencies do not
+become application dependencies. Actions invoked synchronously by these callbacks
+or transport wrappers are not traced. Suppression ends when the callback returns;
+it does not follow work after `await`. If a custom `fetch` wrapper calls actions
+after `await`, exclude those actions with `filter` to prevent each export from
+creating another span. Transport wrappers retain normal dependency tracking.
+Callback effects are not rolled back. Keep filters and redaction observational.
 
 ### Per-trace resource attributes
 
@@ -493,12 +495,17 @@ From the workspace root:
 ```sh
 pnpm --filter @reatom/opentelemetry lint
 pnpm --filter @reatom/opentelemetry test
+pnpm --filter @reatom/opentelemetry build
+pnpm --filter @reatom/opentelemetry test:types
 pnpm --filter @reatom/opentelemetry test:browser
 pnpm --filter @reatom/opentelemetry test:e2e:collector:oracle
 ```
 
 The lint command uses the repository rules for the adapter, its tests, examples
 and E2E scripts. Generated bundles and run artifacts are excluded.
+
+`test:types` checks the public API through the built declarations, so run `build`
+first.
 
 The separate [Collector E2E guide](./e2e/collector/README.md) documents image and
 app-build preparation, execution and comparison of two clean runs. It tests

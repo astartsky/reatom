@@ -45,7 +45,7 @@ const toOtlpDoubleValue = (value: number): OtlpDoubleValue => ({
 
 // Ancestor-stack cycle detection: add on enter, remove on exit so shared-but-
 // non-cyclic references like { a: x, b: x } aren't false-flagged as cycles.
-export const encodeOtlpValue = (
+const encodeOtlpValue = (
   value: OtlpAttrValue,
   seen: WeakSet<object>,
 ): OtlpAnyValue => {
