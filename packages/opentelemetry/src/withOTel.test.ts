@@ -1,7 +1,12 @@
+import { createRequire } from 'node:module'
+
+import type * as core from '@reatom/core'
 import { action, actionMiddleware, context, sleep, wrap } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
+import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
+import { parseSpans } from './test-helpers.ts'
 import { HEX_SPAN_ID, HEX_TRACE_ID } from './test-helpers.ts'
 import { createTestWithOTel } from './test-helpers.ts'
 
@@ -412,5 +417,32 @@ test('thrown queueSpan inside an async action does not become an unhandled rejec
     expect(unhandled).toBe(0)
   } finally {
     process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('actions from another core entrypoint remain callable when installation is incompatible', async () => {
+  const foreign = createRequire(import.meta.url)('@reatom/core') as typeof core
+  const bodies: string[] = []
+  const otel = reatomOpentelemetry({
+    endpoint: 'https://collector.invalid',
+    serviceName: 'mixed-core',
+    fetch: async (_url, init) => {
+      bodies.push(String(init?.body))
+      return new Response(null)
+    },
+  })
+  try {
+    const target = foreign.action(() => 7, 'mixed.foreign')
+    expect(target.extend(otel.withOTel())).toBe(target)
+    expect(foreign.context.start(target)).toBe(7)
+    const local = action(() => 9, 'mixed.local')
+    expect(context.start(local)).toBe(9)
+    await otel.flush()
+    expect(bodies.flatMap(parseSpans).map((span) => span.name)).toEqual([
+      'mixed.local',
+    ])
+    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
+  } finally {
+    otel.dispose()
   }
 })

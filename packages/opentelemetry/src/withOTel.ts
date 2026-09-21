@@ -259,14 +259,18 @@ export const createWithOTel = ({
       return target
     }
     const settings = { ...options }
-    optionsByTarget.set(target, settings)
-    target.extend(
-      withActionMiddleware(
-        () =>
-          (next: Fn, ...params: unknown[]) =>
-            invoke(target.name, settings, params, () => next(...params)),
-      ),
-    )
+    try {
+      target.extend(
+        withActionMiddleware(
+          () =>
+            (next: Fn, ...params: unknown[]) =>
+              invoke(target.name, settings, params, () => next(...params)),
+        ),
+      )
+      optionsByTarget.set(target, settings)
+    } catch {
+      // Another core copy may reject our middleware. Tracing must not break it.
+    }
     return target
   }
   const withOTel = (options: WithOTelOptions = {}): GenericExt<AtomLike> =>

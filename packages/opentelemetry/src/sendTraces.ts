@@ -1,3 +1,4 @@
+import { suppressTracing } from './observation.ts'
 import { tracesUrl } from './tracesUrl.ts'
 
 export interface SendTracesInput {
@@ -59,5 +60,5 @@ export const sendTraces = async (input: SendTracesInput): Promise<Response> => {
     signal: input.signal,
   }
   input.signal?.throwIfAborted()
-  return fetchImpl(url, init)
+  return suppressTracing(() => fetchImpl(url, init))
 }

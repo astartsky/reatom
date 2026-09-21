@@ -14,6 +14,10 @@ explicit context restoration after an await.
 npm install @reatom/opentelemetry
 ```
 
+Use one shared copy of `@reatom/core` for the adapter and application. Actions
+from another copy (including mixed ESM/CJS entrypoints) remain callable but may
+not accept the adapter's middleware and are then left uninstrumented.
+
 ## Quick start
 
 ```ts
@@ -338,6 +342,13 @@ Backoff is exponential with full jitter; the `Retry-After` header (delta
 seconds or HTTP-date) overrides the computed delay when present. After retries
 are exhausted, a non-2xx response is **logged via `console.warn` through the
 batch queue's `onError`** — the tracer never escalates failures to your app.
+Diagnostics include HTTP status or a safe error type, never the configured
+endpoint or raw transport errors that may echo credentials. Collector-provided
+partial-success warning text is still logged.
+
+Collector response bodies are limited to 64 KiB of received bytes; larger bodies
+are cancelled and counted as export failures. Cleanup retains the transport slot
+and any unload byte credit until it settles.
 
 A 2xx response is never retried, including partial success or a malformed body.
 Valid `partialSuccess.rejectedSpans` counts become export drops for the rejected
@@ -507,8 +518,11 @@ browser and turn into no-ops on Node:
   Node — call `await otel.flush()` explicitly before exit.
 - There is no automatic flush on process exit. Call `await otel.flush()`
   before shutting down, otherwise queued spans are lost.
-- `globalThis.fetch` is required (Node ≥ 18). Inject `fetch` via the
-  factory's internal option if you need a polyfill.
+- `globalThis.fetch` and Web Crypto (`globalThis.crypto.getRandomValues`) are
+  required. Use a Node runtime that exposes both, or install the corresponding
+  polyfills before creating the adapter. `fetch` can also be injected through
+  the factory option. Missing Web Crypto drops observations without changing
+  application results; availability of `fetch` alone is insufficient.
 
 ```ts
 const otel = reatomOpentelemetry({

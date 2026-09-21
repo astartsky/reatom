@@ -1,3 +1,4 @@
+import { suppressTracing } from './observation.ts'
 import { tracesUrl } from './tracesUrl.ts'
 
 export interface FlushWithBeaconInput {
@@ -18,9 +19,11 @@ export const flushWithBeacon = (input: FlushWithBeaconInput): boolean => {
   const sendBeacon = input.sendBeacon ?? fallback
   if (!sendBeacon) return false
   try {
-    return sendBeacon(
-      tracesUrl(input.endpoint),
-      new Blob([input.body], { type: 'application/json' }),
+    return suppressTracing(() =>
+      sendBeacon(
+        tracesUrl(input.endpoint),
+        new Blob([input.body], { type: 'application/json' }),
+      ),
     )
   } catch {
     return false

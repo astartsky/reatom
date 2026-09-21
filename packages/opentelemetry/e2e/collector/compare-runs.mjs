@@ -15,7 +15,7 @@ const normalize = (value) => {
 }
 
 const read = async (directory, name) =>
-  JSON.parse(await readFile(join(directory, name), 'utf8'))
+  JSON.parse(await readFile(join(directory, 'output', name), 'utf8'))
 const [first, second] = process.argv.slice(2)
 assert(
   first && second,

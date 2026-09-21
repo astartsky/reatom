@@ -1,5 +1,3 @@
-const MAX_INT64 = 9_223_372_036_854_775_807n
-
 const invalidResponse = (): never => {
   throw new Error('Invalid OTLP export response')
 }
@@ -8,17 +6,15 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
 const parseRejectedSpans = (value: unknown, keptCount: number): number => {
-  if (typeof value === 'number') {
-    if (!Number.isSafeInteger(value) || value < 0 || value > keptCount)
-      return invalidResponse()
-    return value
-  }
-  if (typeof value !== 'string' || !/^\d+$/.test(value))
+  if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value)
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > keptCount
+  )
     return invalidResponse()
-  const rejected = BigInt(value)
-  if (rejected > MAX_INT64 || rejected > BigInt(keptCount))
-    return invalidResponse()
-  return Number(rejected)
+  return value
 }
 
 /** Parses an OTLP/HTTP 2xx body after the transport has already settled. */
@@ -52,5 +48,32 @@ export const parseExportResponse = (
     accepted: keptCount - rejected,
     rejected,
     ...(errorMessage === undefined ? {} : { errorMessage }),
+  }
+}
+
+/** Bound untrusted collector responses; keep transport ownership through cancel. */
+export const readExportResponse = async (
+  response: Response,
+  keptCount: number,
+) => {
+  const reader = response.body?.getReader()
+  if (!reader) return parseExportResponse('', keptCount)
+  const decoder = new TextDecoder()
+  let bytes = 0
+  let text = ''
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      bytes += value.byteLength
+      if (bytes > 64 * 1024) {
+        await reader.cancel()
+        throw new Error('OTLP export response exceeds 64 KiB')
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    return parseExportResponse(text + decoder.decode(), keptCount)
+  } finally {
+    reader.releaseLock()
   }
 }

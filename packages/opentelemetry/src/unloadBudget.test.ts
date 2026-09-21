@@ -93,112 +93,124 @@ test('keepalive selection includes the UTF-8 envelope and preserves mixed partia
   }
 })
 
-test('HTTP 503 unload keeps document credit through cancel and never retries', async () => {
-  const page = installDocument()
-  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-  const firstBodies: string[] = []
-  const secondBodies: string[] = []
-  let enterCancel!: () => void
-  const cancelStarted = new Promise<void>((resolve) => {
-    enterCancel = resolve
-  })
-  let settleCancel!: () => void
-  const cancelSettled = new Promise<void>((resolve) => {
-    settleCancel = resolve
-  })
-  const fetchA = vi.fn(async (_url: unknown, init?: RequestInit) => {
-    firstBodies.push(String(init?.body))
-    return new Response(
-      new ReadableStream({
-        cancel() {
-          enterCancel()
-          return cancelSettled
-        },
-      }),
-      { status: 503, statusText: 'busy' },
-    )
-  })
-  const fetchB = vi.fn(async (_url: unknown, init?: RequestInit) => {
-    secondBodies.push(String(init?.body))
-    return new Response('{}')
-  })
-  const a = reatomOpentelemetry({
-    ...base,
-    filter: (target) => target.name.startsWith('a.'),
-    retry: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 },
-    fetch: fetchA,
-  })
-  const b = reatomOpentelemetry({
-    ...base,
-    filter: (target) => target.name.startsWith('b.'),
-    fetch: fetchB,
-  })
-  try {
-    emit('a.older', 2, 4900)
-    const kept = emit('a.newer', 8, 2000)
-    page.hide()
-    await cancelStarted
-    expect(fetchA.mock.calls[0]?.[1]?.keepalive).toBe(true)
-    expect(fetchA).toHaveBeenCalledTimes(1)
-    expect(parseSpans(firstBodies[0]!).map((span) => span.name)).toEqual(kept)
-    expect(a.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 10,
-      exported: 0,
-      dropped: 0,
+test.each(['HTTP 503', 'oversized response'] as const)(
+  '%s unload keeps document credit through cancel and never retries',
+  async (failure: 'HTTP 503' | 'oversized response') => {
+    const page = installDocument()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const firstBodies: string[] = []
+    const secondBodies: string[] = []
+    let cancelStarted = false
+    let settleCancel!: () => void
+    const cancelSettled = new Promise<void>((resolve) => {
+      settleCancel = resolve
     })
+    const fetchA = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      firstBodies.push(String(init?.body))
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            if (failure === 'oversized response') {
+              for (let i = 0; i < 4; i++)
+                controller.enqueue(new Uint8Array(32 * 1024))
+              controller.close()
+            }
+          },
+          cancel() {
+            cancelStarted = true
+            return cancelSettled
+          },
+        }),
+        { status: failure === 'HTTP 503' ? 503 : 200 },
+      )
+    })
+    const fetchB = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      secondBodies.push(String(init?.body))
+      return new Response('{}')
+    })
+    const a = reatomOpentelemetry({
+      ...base,
+      filter: (target) => target.name.startsWith('a.'),
+      retry: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: fetchA,
+    })
+    const b = reatomOpentelemetry({
+      ...base,
+      filter: (target) => target.name.startsWith('b.'),
+      fetch: fetchB,
+    })
+    try {
+      emit('a.older', 2, 4900)
+      const kept = emit('a.newer', 8, 2000)
+      page.hide()
+      await vi.waitFor(() => expect(cancelStarted).toBe(true), {
+        timeout: 500,
+        interval: 5,
+      })
+      expect(fetchA.mock.calls[0]?.[1]?.keepalive).toBe(true)
+      expect(fetchA).toHaveBeenCalledTimes(1)
+      expect(parseSpans(firstBodies[0]!).map((span) => span.name)).toEqual(kept)
+      expect(a.stats()).toMatchObject({
+        active: 0,
+        queued: 0,
+        inFlight: 10,
+        exported: 0,
+        dropped: 0,
+      })
 
-    emit('b.blocked', 1, 4000)
-    page.hide()
-    await b.flush()
-    expect(fetchB).not.toHaveBeenCalled()
-    expect(b.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 0,
-      dropped: 1,
-      droppedByReason: { oversized: 1 },
-    })
+      emit('b.blocked', 1, 4000)
+      page.hide()
+      await b.flush()
+      expect(fetchB).not.toHaveBeenCalled()
+      expect(b.stats()).toMatchObject({
+        active: 0,
+        queued: 0,
+        inFlight: 0,
+        dropped: 1,
+        droppedByReason: { oversized: 1 },
+      })
 
-    settleCancel()
-    await a.flush()
-    expect(fetchA).toHaveBeenCalledTimes(1)
-    expect(a.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 0,
-      exported: 0,
-      dropped: 10,
-      droppedByReason: { oversized: 2, export: 8 },
-    })
+      settleCancel()
+      await a.flush()
+      expect(fetchA).toHaveBeenCalledTimes(1)
+      expect(a.stats()).toMatchObject({
+        active: 0,
+        queued: 0,
+        inFlight: 0,
+        exported: 0,
+        dropped: 10,
+        droppedByReason: { oversized: 2, export: 8 },
+      })
 
-    const after = emit('b.after', 1, 4000)
-    page.hide()
-    await b.flush()
-    expect(fetchB).toHaveBeenCalledTimes(1)
-    expect(fetchB.mock.calls[0]?.[1]?.keepalive).toBe(true)
-    expect(parseSpans(secondBodies[0]!).map((span) => span.name)).toEqual(after)
-    expect(bytes(secondBodies[0]!)).toBeLessThanOrEqual(LIMIT)
-    expect(b.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 0,
-      exported: 1,
-      dropped: 1,
-      droppedByReason: { oversized: 1 },
-    })
-  } finally {
-    a.dispose()
-    b.dispose()
-    settleCancel()
-    await Promise.resolve()
-    await a.flush()
-    await b.flush()
-    warn.mockRestore()
-    vi.unstubAllGlobals()
-  }
-})
+      const after = emit('b.after', 1, 4000)
+      page.hide()
+      await b.flush()
+      expect(fetchB).toHaveBeenCalledTimes(1)
+      expect(fetchB.mock.calls[0]?.[1]?.keepalive).toBe(true)
+      expect(parseSpans(secondBodies[0]!).map((span) => span.name)).toEqual(
+        after,
+      )
+      expect(bytes(secondBodies[0]!)).toBeLessThanOrEqual(LIMIT)
+      expect(b.stats()).toMatchObject({
+        active: 0,
+        queued: 0,
+        inFlight: 0,
+        exported: 1,
+        dropped: 1,
+        droppedByReason: { oversized: 1 },
+      })
+    } finally {
+      a.dispose()
+      b.dispose()
+      settleCancel()
+      await Promise.resolve()
+      await a.flush()
+      await b.flush()
+      warn.mockRestore()
+      vi.unstubAllGlobals()
+    }
+  },
+)
 
 test.each([false, true])(
   'adapters share pending fetch bytes through body settlement (second beacon=%s)',

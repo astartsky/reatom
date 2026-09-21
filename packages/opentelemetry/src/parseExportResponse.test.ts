@@ -4,6 +4,16 @@ import { parseExportResponse } from './parseExportResponse.ts'
 
 test.each([
   ['', 5, { accepted: 5, rejected: 0 }],
+  [
+    '{"partialSuccess":{"rejectedSpans":"0004"}}',
+    5,
+    { accepted: 1, rejected: 4 },
+  ],
+  [
+    '{"partialSuccess":{"rejectedSpans":"9007199254740991"}}',
+    Number.MAX_SAFE_INTEGER,
+    { accepted: 0, rejected: Number.MAX_SAFE_INTEGER },
+  ],
   ['{}', 5, { accepted: 5, rejected: 0 }],
   ['{"partialSuccess":{}}', 5, { accepted: 5, rejected: 0 }],
   ['{"partialSuccess":{"rejectedSpans":4}}', 5, { accepted: 1, rejected: 4 }],

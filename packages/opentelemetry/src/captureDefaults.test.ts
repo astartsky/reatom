@@ -103,6 +103,7 @@ test('default exception preserves the throw and exports only its safe type', asy
   const { run, otel, bodies, spans } = setup(true)
   const error = new Error('message-private-sentinel')
   error.stack = 'stack-private-sentinel'
+  error.name = 'name-private-sentinel'
   try {
     const target = run(() =>
       action(() => {
@@ -130,6 +131,7 @@ test('default exception preserves the throw and exports only its safe type', asy
     })
     expect(bodies.join('')).not.toContain('message-private-sentinel')
     expect(bodies.join('')).not.toContain('stack-private-sentinel')
+    expect(bodies.join('')).not.toContain('name-private-sentinel')
     expect(spans()[0]!.status?.message).toBeUndefined()
   } finally {
     otel!.dispose()

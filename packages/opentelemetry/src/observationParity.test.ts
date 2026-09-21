@@ -10,7 +10,7 @@ import {
 import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-import { parseSpans } from './test-helpers.ts'
+import { installDomStubs, parseSpans } from './test-helpers.ts'
 
 test.each(['size', 'timer', 'flush'] as const)(
   'transport can read its bound computed when dispatched by %s',
@@ -21,6 +21,8 @@ test.each(['size', 'timer', 'flush'] as const)(
     const token = run(() => computed(() => 'token-7'))
     expect(run(token)).toBe('token-7')
     const sent: Array<{ token: string; names: string[] }> = []
+    let report = () => {}
+    let reported = 0
     const fetch: typeof globalThis.fetch = run(() =>
       bind(async (_url: RequestInfo | URL, init?: RequestInit) => {
         const authorization = token()
@@ -28,6 +30,8 @@ test.each(['size', 'timer', 'flush'] as const)(
           token: authorization,
           names: parseSpans(init?.body).map((span) => span.name),
         })
+        // Bound the broken exporter so the RED run terminates.
+        if (sent.length < 5) report()
         return new Response(null)
       }),
     )
@@ -39,6 +43,11 @@ test.each(['size', 'timer', 'flush'] as const)(
       retry: { maxRetries: 0 },
       fetch,
     })
+    report = run(() =>
+      action(() => {
+        reported++
+      }, 'transport.metric'),
+    )
     try {
       expect(run(() => action(() => 7, 'transport.target')())).toBe(7)
       const flush = trigger === 'flush' ? otel.flush() : undefined
@@ -51,6 +60,12 @@ test.each(['size', 'timer', 'flush'] as const)(
         dropped: 0,
         inFlight: 0,
       })
+      expect(reported).toBe(1)
+      run(report)
+      await otel.flush()
+      expect(sent[1]).toEqual({ token: 'token-7', names: ['transport.metric'] })
+      expect(sent).toHaveLength(2)
+      expect(reported).toBe(3)
     } finally {
       otel.dispose()
       warn.mockRestore()
@@ -205,3 +220,45 @@ test.each([false, true])(
     }
   },
 )
+
+test('beacon wrappers execute application actions without creating another export', async () => {
+  const { windowListeners, restore } = installDomStubs()
+  const run = context.start(() => bind(<T>(callback: () => T) => callback()))
+  let reported = 0
+  let report = () => {}
+  let requests = 0
+  const otel = reatomOpentelemetry({
+    endpoint: 'https://collector.invalid',
+    serviceName: 'beacon-observation',
+    useBeacon: true,
+    sendBeacon: () => {
+      requests++
+      run(report)
+      return true
+    },
+  })
+  report = run(() =>
+    action(() => {
+      reported++
+    }, 'beacon.metric'),
+  )
+  try {
+    run(() => action(() => 7, 'beacon.user')())
+    windowListeners.get('pagehide')!()
+    windowListeners.get('pagehide')!()
+    expect(requests).toBe(1)
+    expect(reported).toBe(1)
+    expect(otel.stats()).toMatchObject({
+      beaconAccepted: 1,
+      queued: 0,
+      dropped: 0,
+    })
+    run(report)
+    windowListeners.get('pagehide')!()
+    expect(requests).toBe(2)
+    expect(reported).toBe(3)
+  } finally {
+    otel.dispose()
+    restore()
+  }
+})

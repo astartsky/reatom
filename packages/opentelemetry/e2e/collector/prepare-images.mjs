@@ -51,7 +51,7 @@ export async function freshArtifacts(requested, prefix) {
   )
   await mkdir(dirname(directory), { recursive: true })
   // Refuse even an existing empty directory: never truncate older evidence.
-  await mkdir(directory)
+  await mkdir(directory, { mode: 0o700 })
   return directory
 }
 

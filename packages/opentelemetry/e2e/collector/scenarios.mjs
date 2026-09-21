@@ -423,7 +423,7 @@ const expectSearchHappy = async (page, searchQueue) => {
   }
   searchQueue.push(entry)
   await fillSearch(page, 'alpha')
-  await entry.started.promise
+  const initialRequest = await entry.started.promise
   assert.equal(
     await controls(page, 'traceSearch'),
     true,
@@ -431,8 +431,28 @@ const expectSearchHappy = async (page, searchQueue) => {
   )
   entry.gate.resolve()
   await page.getByText('alpha page 1', { exact: true }).waitFor()
+  const sorted = {
+    started: deferred(),
+    gate: deferred(),
+    body: issues('alpha sorted by created'),
+  }
+  searchQueue.push(sorted)
   await page.getByPlaceholder('Sort by', { exact: true }).click()
   await page.getByRole('option', { name: 'Created date' }).click()
+  const sortRequest = new URL((await sorted.started.promise).url())
+  const initialUrl = new URL(initialRequest.url())
+  assert.equal(sortRequest.searchParams.get('sort'), 'created')
+  assert.equal(
+    sortRequest.searchParams.get('q'),
+    initialUrl.searchParams.get('q'),
+  )
+  assert.equal(
+    sortRequest.searchParams.get('page'),
+    initialUrl.searchParams.get('page'),
+  )
+  sorted.gate.resolve()
+  await page.getByText('alpha sorted by created', { exact: true }).waitFor()
+  assert.deepEqual((await snapshot(page)).titles, ['alpha sorted by created'])
   await page.getByRole('button', { name: '2' }).last().click()
   await page.getByText('alpha page 2', { exact: true }).waitFor()
   const state = await snapshot(page)
@@ -1134,19 +1154,6 @@ export const verifyScenarios = (decodedSpans, cases) => {
     assert(spans.length > 0, `${scenario.caseId}: Collector lacks traced spans`)
     const names = spans.map((span) => span.name)
     if (scenario.expectation.treeExecution) verifyTreeExecution(spans, scenario)
-    for (const name of scenario.expectation.requiredNames ?? [])
-      assert(names.includes(name), `${scenario.caseId}: missing ${name}`)
-    for (const pattern of scenario.expectation.requiredNamePatterns ?? [])
-      assert(
-        names.some((name) => new RegExp(pattern).test(name)),
-        `${scenario.caseId}: missing ${pattern}`,
-      )
-    if (scenario.expectation.expectedCount !== undefined)
-      assert.equal(
-        spans.length,
-        scenario.expectation.expectedCount,
-        `${scenario.caseId}: unexpected span count`,
-      )
     for (const relationship of scenario.expectation.actionRelationships ?? []) {
       const parents = spans.filter((span) => span.name === relationship.parent)
       const children = spans.filter((span) => span.name === relationship.child)

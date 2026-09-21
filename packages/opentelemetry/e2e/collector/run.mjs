@@ -69,16 +69,17 @@ async function main() {
     'reatom-collector-run',
   )
   const project = `reatom-otel-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
-  // Collector and runner both use UID 10001; only these fresh synthetic
-  // artifacts are writable. No host chown, repo chmod or privileged container.
-  await chmod(artifacts, 0o777)
-  await mkdir(join(artifacts, 'collector'), { mode: 0o777 })
-  await chmod(join(artifacts, 'collector'), 0o777)
+  // Mount only synthetic output. Host metadata stays behind the private parent.
+  const output = join(artifacts, 'output')
+  await mkdir(output, { mode: 0o777 })
+  await chmod(output, 0o777)
+  await mkdir(join(output, 'collector'), { mode: 0o777 })
+  await chmod(join(output, 'collector'), 0o777)
   console.log(`Collector artifacts: ${artifacts}\nCompose project: ${project}`)
   const environment = {
     COLLECTOR_IMAGE: inputs.images.collector.image,
     COLLECTOR_RUNNER_IMAGE: inputs.runnerTag,
-    COLLECTOR_ARTIFACTS: artifacts,
+    COLLECTOR_ARTIFACTS: output,
     COLLECTOR_APPS: apps,
     COLLECTOR_RUN_ID: process.env.COLLECTOR_RUN_ID ?? project,
     COLLECTOR_CASE: process.env.COLLECTOR_CASE ?? '',

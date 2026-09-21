@@ -23,6 +23,7 @@ import {
   HEX_TRACE_ID,
   installDomStubs,
   parsePayload,
+  parseSpans,
   withWarnSpy,
 } from './test-helpers.ts'
 
@@ -272,9 +273,14 @@ test('persistent retryable failures retry and eventually succeed', async () => {
   await otel.flush()
 
   expect(attempts).toBe(3)
-  expect(collectedSpans().some((s) => s.name === 'integration.retry')).toBe(
-    true,
-  )
+  expect(received).toHaveLength(3)
+  const payloads = received.map((request) => JSON.parse(request.body))
+  expect(payloads[1]).toEqual(payloads[0])
+  expect(payloads[2]).toEqual(payloads[0])
+  const accepted = parseSpans(payloads[2])
+  expect(accepted).toHaveLength(1)
+  expect(accepted[0]!.name).toBe('integration.retry')
+  expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
 })
 
 test('persistent HTTP failure surfaces as a console.warn and never escalates', async () => {

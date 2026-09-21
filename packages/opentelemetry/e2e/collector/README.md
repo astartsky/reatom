@@ -64,8 +64,10 @@ pnpm --filter @reatom/opentelemetry test:e2e:collector
 
 The Compose project uses an internal network with no published ports, host
 networking or Docker socket. Test scripts and built applications are mounted
-read-only. Only a fresh artifacts directory is writable. Cleanup affects that
-run's project and preserves its evidence.
+read-only. Only a fresh `output/` subdirectory is writable by containers.
+Host command logs and metadata stay in its private parent directory (mode 0700),
+which is not mounted into either container. Cleanup affects that run's project
+and preserves its evidence.
 
 The host stops the Collector gracefully before running the final verification;
 it does not restart the file exporter. Assertions read the Collector's JSONL,
@@ -76,7 +78,8 @@ file exporter and decoder work. Disabled instrumentation and an unavailable
 receiver are negative controls, not successful empty traces.
 
 Each run keeps raw Collector records, native NetLog, request bodies, app outcomes, semantic
-graphs, logs and version/build information under its artifacts directory.
+graphs and version/build information under `ARTIFACTS/output/`. Host logs and
+metadata remain at `ARTIFACTS/`.
 Compare two successful clean runs with:
 
 ```sh

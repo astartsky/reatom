@@ -2,9 +2,10 @@
 
 ### Feat
 
-- **opentelemetry**: initial release. Auto-instrumentation of Reatom atoms
-  and actions via `addGlobalExtension`, OTLP/HTTP JSON transport with
-  retry/backoff, batched export, `navigator.sendBeacon` flush on page
-  unload, and the `reatomOpentelemetry` factory plus `withOTel` per-target
-  override extension. Ships traces only — no SDK dependency, no metrics,
-  no logs, no compression, no offline buffering.
+- **opentelemetry**: initial release. Action tracing through public Reatom
+  middleware, explicit `startTrace` / `withContext` boundaries, metadata-only
+  defaults and opt-in value capture. Batched OTLP/HTTP JSON export supports
+  retry/backoff and partial success. Unload uses bounded keepalive fetch by
+  default, with optional `navigator.sendBeacon`. No changes to `@reatom/core`,
+  reactive spans, automatic dependency links or implicit async trace context.
+  Ships traces only, without an SDK dependency, metrics or offline buffering.

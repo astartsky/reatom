@@ -16,10 +16,11 @@ import { createValueCapture } from './captureValues.ts'
 import type { Reservation, TelemetryStats } from './createBatchQueue.ts'
 import { createBatchQueue } from './createBatchQueue.ts'
 import { createExportWorker } from './createExportWorker.ts'
+import { errorData, exceptionType } from './errorMetadata.ts'
 import { flushWithBeacon } from './flushWithBeacon.ts'
 import { hexFromBytes } from './hexFromBytes.ts'
 import { isObserving, observe } from './observation.ts'
-import { parseExportResponse } from './parseExportResponse.ts'
+import { readExportResponse } from './parseExportResponse.ts'
 import { resolveQueueOptions } from './queueOptions.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
 import type { RetryWithBackoffInput } from './retryWithBackoff.ts'
@@ -154,10 +155,16 @@ export const reatomOpentelemetry = (
   const logExportError = (error: unknown, dropped?: readonly unknown[]) =>
     observe(() => {
       if (isAbort(error)) return
+      // Transport errors may echo credentials from the request URL.
+      const message = errorData(error, 'message')
+      const reason =
+        typeof message === 'string' && /^HTTP \d{3}$/.test(message)
+          ? message
+          : exceptionType(error)
       const detail = dropped ? ` (dropped ${dropped.length} spans)` : ''
       console.warn(
-        `[@reatom/opentelemetry] OTLP export to ${input.endpoint} failed${detail}:`,
-        error,
+        `[@reatom/opentelemetry] OTLP export failed${detail}:`,
+        reason,
       )
     })
   const resourceAttributes = observe(() => {
@@ -263,16 +270,14 @@ export const reatomOpentelemetry = (
         })
         if (!response.ok) {
           await response.body?.cancel()
-          throw new Error(
-            `HTTP ${response.status} ${response.statusText}`.trimEnd(),
-          )
+          throw new Error(`HTTP ${response.status}`)
         }
         // A body read remains part of the transport and its byte reservation.
-        const outcome = parseExportResponse(await response.text(), keptCount)
+        const outcome = await readExportResponse(response, keptCount)
         if (outcome.rejected || outcome.errorMessage)
           observe(() =>
             console.warn(
-              `[@reatom/opentelemetry] OTLP export to ${input.endpoint}: partialSuccess rejected ${outcome.rejected} spans${outcome.errorMessage ? ': ' + outcome.errorMessage : ''}`,
+              `[@reatom/opentelemetry] OTLP export: partialSuccess rejected ${outcome.rejected} spans${outcome.errorMessage ? ': ' + outcome.errorMessage : ''}`,
             ),
           )
         return {
