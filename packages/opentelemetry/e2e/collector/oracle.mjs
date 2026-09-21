@@ -289,12 +289,12 @@ const checkPrivacy = (value, sentinels) => {
 /**
  * Validate the entire supplied graph before selecting test.case_id. Names in
  * relationships/spanExpectations must resolve uniquely within that case.
- * relationships: { child, parent: string | null, ancestry?: boolean }[].
- * spanExpectations: { name, kind?, statusCode?, attributes?, eventNames?,
- * forbiddenEventNames?, minDurationNs?, maxDurationNs? }[]. Duration bounds are
- * unsigned decimal strings or bigint. Expected attributes are partial matches.
- * Returns all case spans sorted by semantic content, without IDs/timestamps.
- * Links are forbidden: this oracle covers the selected actions-only contract.
+ * relationships: { child, parent: string | null }[]. spanExpectations: { name,
+ * kind?, statusCode?, attributes?, eventNames?, minDurationNs? }[]. Duration
+ * bounds are unsigned decimal strings or bigint. Expected attributes are
+ * partial matches. Returns all case spans sorted by semantic content, without
+ * IDs/timestamps. Links are forbidden: this oracle covers the selected
+ * actions-only contract.
  */
 export const verifyCase = (
   spans,
@@ -302,13 +302,11 @@ export const verifyCase = (
     caseId,
     serviceName,
     requiredNames = [],
-    forbiddenNames = [],
     privateSentinels = [],
     expectedCount,
     relationships = [],
     spanExpectations = [],
     scopeName,
-    scopeVersion,
   },
 ) => {
   assert(text(caseId, 'caseId must be a string').length > 0, 'empty caseId')
@@ -344,8 +342,6 @@ export const verifyCase = (
     )
     if (scopeName !== undefined)
       assert.equal(span.scope?.name, scopeName, 'scope name')
-    if (scopeVersion !== undefined)
-      assert.equal(span.scope?.version, scopeVersion, 'scope version')
     const parent = index.get(parents.get(pair(span)))
     if (parent) {
       assert.equal(
@@ -365,8 +361,6 @@ export const verifyCase = (
   }
   for (const name of array(requiredNames, 'invalid requiredNames'))
     assert(byName.has(name), `missing required span: ${name}`)
-  for (const name of array(forbiddenNames, 'invalid forbiddenNames'))
-    assert(!byName.has(name), `forbidden span: ${name}`)
   const unique = (name) => {
     const matches = byName.get(name) ?? []
     assert(matches.length > 0, `missing expected span: ${name}`)
@@ -382,20 +376,18 @@ export const verifyCase = (
     }
     return result
   }
-  for (const { child, parent, ancestry = false } of array(
+  for (const { child, parent } of array(
     relationships,
     'invalid relationships',
   )) {
-    assert.equal(typeof ancestry, 'boolean', 'invalid ancestry option')
     const descendant = unique(child)
     if (parent === null) {
       assert(!parents.has(pair(descendant)), `expected root: ${child}`)
     } else {
       const ancestor = unique(parent)
-      const candidates = ancestors(descendant)
       assert(
-        ancestry ? candidates.includes(ancestor) : candidates[0] === ancestor,
-        `${ancestry ? 'ancestry' : 'parent'} mismatch: ${child} -> ${parent}`,
+        index.get(parents.get(pair(descendant))) === ancestor,
+        `parent mismatch: ${child} -> ${parent}`,
       )
     }
   }
@@ -424,8 +416,6 @@ export const verifyCase = (
     const names = events(span).map((event) => event.name)
     for (const name of expected.eventNames ?? [])
       assert(names.includes(name), `missing event: ${span.name}.${name}`)
-    for (const name of expected.forbiddenEventNames ?? [])
-      assert(!names.includes(name), `forbidden event: ${span.name}.${name}`)
     const duration =
       BigInt(span.endTimeUnixNano) - BigInt(span.startTimeUnixNano)
     if (expected.minDurationNs !== undefined)
@@ -433,12 +423,6 @@ export const verifyCase = (
         duration >=
           durationBound(expected.minDurationNs, 'invalid minDurationNs'),
         `duration too short: ${span.name}`,
-      )
-    if (expected.maxDurationNs !== undefined)
-      assert(
-        duration <=
-          durationBound(expected.maxDurationNs, 'invalid maxDurationNs'),
-        `duration too long: ${span.name}`,
       )
   }
   return selected

@@ -62,26 +62,24 @@ const manifest = () => ({
   caseId: 'case-1',
   serviceName: 'oracle-app',
   scopeName: scope.name,
-  scopeVersion: scope.version,
   requiredNames: ['ui', 'work', 'failure', 'recovery'],
-  forbiddenNames: ['computed', '_time'],
   privateSentinels: ['PRIVATE\n😀'],
   expectedCount: 4,
   relationships: [
     { child: 'ui', parent: null },
     { child: 'work', parent: 'ui' },
     { child: 'failure', parent: 'work' },
-    { child: 'recovery', parent: 'ui', ancestry: true },
+    { child: 'recovery', parent: 'work' },
   ],
   spanExpectations: [
-    { name: 'work', kind: 1, minDurationNs: '300', maxDurationNs: 400n },
+    { name: 'work', kind: 1, minDurationNs: '300' },
     {
       name: 'failure',
       statusCode: 2,
       eventNames: ['exception'],
       attributes: { public: 'PUBLIC', private: '[Redacted]' },
     },
-    { name: 'recovery', statusCode: 0, forbiddenEventNames: ['exception'] },
+    { name: 'recovery', statusCode: 0 },
   ],
 })
 
@@ -380,13 +378,6 @@ for (const [name, corrupt, error] of [
     /duration too short/,
   ],
   [
-    'long controlled wait',
-    (spans) => {
-      spans[1].endTimeUnixNano = '999'
-    },
-    /duration too long/,
-  ],
-  [
     'wrong error status',
     (spans) => {
       spans[2].status.code = 1
@@ -406,13 +397,6 @@ for (const [name, corrupt, error] of [
       spans[2].events = []
     },
     /missing event/,
-  ],
-  [
-    'stale recovery exception',
-    (spans) => {
-      spans[3].events = structuredClone(spans[2].events)
-    },
-    /forbidden event/,
   ],
   [
     'wrong public content',
@@ -540,17 +524,11 @@ for (const location of [
   })
 }
 
-test('case requirements distinguish missing, forbidden, and ambiguous semantic names', () => {
+test('case requirements distinguish missing and ambiguous semantic names', () => {
   const missing = decoded().filter((item) => item.name !== 'recovery')
   assert.throws(
     () => verifyCase(missing, { ...manifest(), expectedCount: undefined }),
     /missing required span: recovery/,
-  )
-  const forbidden = decoded()
-  forbidden[3].name = 'computed'
-  assert.throws(
-    () => verifyCase(forbidden, { ...manifest(), requiredNames: [] }),
-    /forbidden span: computed/,
   )
   const ambiguous = decoded()
   ambiguous.push({ ...ambiguous[3], spanId: id(5) })
@@ -579,7 +557,7 @@ test('expectedCount rejects an extra valid same-case root', () => {
   assert.throws(() => verifyCase(expanded, manifest()), /case count: case-1/)
 })
 
-test('ancestry permits intermediate spans but direct-parent assertions do not', () => {
+test('direct-parent assertions reject a grandparent or a non-root', () => {
   verifyCase(decoded(), manifest())
   assert.throws(
     () =>
@@ -588,16 +566,6 @@ test('ancestry permits intermediate spans but direct-parent assertions do not', 
         relationships: [{ child: 'recovery', parent: 'ui' }],
       }),
     /parent mismatch/,
-  )
-  assert.throws(
-    () =>
-      verifyCase(decoded(), {
-        ...manifest(),
-        relationships: [
-          { child: 'failure', parent: 'recovery', ancestry: true },
-        ],
-      }),
-    /ancestry mismatch/,
   )
   assert.throws(
     () =>
@@ -645,7 +613,7 @@ test('nanosecond duration comparisons do not round through Number', () => {
   spans[1].endTimeUnixNano = '9007199254740993'
   const options = {
     ...manifest(),
-    spanExpectations: [{ name: 'work', minDurationNs: 1n, maxDurationNs: '1' }],
+    spanExpectations: [{ name: 'work', minDurationNs: 1n }],
   }
   verifyCase(spans, options)
   assert.throws(

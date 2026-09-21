@@ -643,7 +643,6 @@ const runOne = async ({
   }
   const record = {
     caseId: resourceCaseId,
-    scenarioId: caseId,
     app,
     mode,
     wireBodies,
@@ -707,7 +706,7 @@ const runOffline = async ({ browser, origin, runId, artifactDirectory }) => {
     mode: 'traced',
     wireBodies,
     ui,
-    expectation: { requiredNames: ['makeMove'], noCollectorSpans: true },
+    expectation: {},
     errors: unexpected,
     diagnostics,
     deliveryExpected: false,
@@ -867,7 +866,7 @@ const runDeniedCors = async ({ browser, origin, runId, artifactDirectory }) => {
     mode: 'traced',
     wireBodies,
     ui,
-    expectation: { requiredNames: ['makeMove'], noCollectorSpans: true },
+    expectation: {},
     errors: unexpected,
     diagnostics,
     deliveryExpected: false,

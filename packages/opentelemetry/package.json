@@ -70,7 +70,6 @@
     "/dist"
   ],
   "devDependencies": {
-    "@vitest/spy": "catalog:",
     "tsdown": "catalog:",
     "vitest": "catalog:",
     "@vitest/browser-playwright": "catalog:",
