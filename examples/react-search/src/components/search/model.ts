@@ -1,5 +1,7 @@
-import { atom, wrap, computed, sleep, withAsyncData } from '@reatom/core'
-import { searchIssues, SearchFilters } from '../../api'
+import { atom, computed, sleep, withAsyncData, wrap } from '@reatom/core'
+
+import type { SearchFilters } from '../../api'
+import { searchIssues } from '../../api'
 
 export const issueQuery = atom('', 'issueQuery')
 export const issueState = atom('open' as SearchFilters['state'], 'issueState')
@@ -28,8 +30,6 @@ export const issuesResource = computed(async () => {
     }
   }
 
-  await wrap(sleep(250))
-
   const filters = {
     query,
     state: issueState(),
@@ -44,6 +44,8 @@ export const issuesResource = computed(async () => {
     page: issuePage(),
     perPage: issuePerPage(),
   }
+
+  await wrap(sleep(250))
 
   return searchIssues(filters)
 }, 'issuesResource').extend(withAsyncData())
