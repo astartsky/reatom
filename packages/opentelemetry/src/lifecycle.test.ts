@@ -4,26 +4,17 @@ import { expect, test, vi } from 'vitest'
 import type { CaptureValuesOptions } from './captureValues.ts'
 import type { ReatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
+import { parseSpans } from './test-helpers.ts'
 
 const ENDPOINT = 'https://otel.test'
-
-interface WireSpan {
-  name: string
-  traceId: string
-  spanId: string
-  parentSpanId?: string
-}
-interface WirePayload {
-  resourceSpans: Array<{ scopeSpans: Array<{ spans: WireSpan[] }> }>
-}
 
 interface Setup {
   otel: ReatomOpentelemetry
   fetchMock: ReturnType<typeof vi.fn>
-  exported: WirePayload[]
+  exported: unknown[]
 }
 const setup = (captureValues?: CaptureValuesOptions) => {
-  const exported: WirePayload[] = []
+  const exported: unknown[] = []
   const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
     exported.push(JSON.parse(String(init?.body)))
     return new Response('{}', { status: 200 })
@@ -264,10 +255,6 @@ test('after dispose: sync throw keeps error identity without error-field inspect
 })
 
 test('dispose -> new adapter -> same targets: exported child parents to the NEW parent, no old IDs', async () => {
-  const collect = (payloads: WirePayload[]): WireSpan[] =>
-    payloads.flatMap((p) =>
-      p.resourceSpans.flatMap((rs) => rs.scopeSpans.flatMap((ss) => ss.spans)),
-    )
   const a1 = setup()
   let a2: Setup | undefined
   try {
@@ -280,7 +267,7 @@ test('dispose -> new adapter -> same targets: exported child parents to the NEW 
       parent()
     })
     await a1.otel.flush()
-    const oldSpans = collect(a1.exported)
+    const oldSpans = a1.exported.flatMap(parseSpans)
     expect(oldSpans.map((s) => s.name).sort()).toEqual(['rechild', 'reparent'])
     const oldIds = new Set(oldSpans.map((s) => s.spanId))
     expect(oldIds.size).toBe(2)
@@ -294,7 +281,7 @@ test('dispose -> new adapter -> same targets: exported child parents to the NEW 
       parent()
     })
     await a2.otel.flush()
-    const newSpans = collect(a2.exported)
+    const newSpans = a2.exported.flatMap(parseSpans)
     const newParent = newSpans.find((s) => s.name === 'reparent')
     const newChild = newSpans.find((s) => s.name === 'rechild')
     expect(newSpans).toHaveLength(2)

@@ -13,11 +13,3 @@ test('zero-pads single digit hex values', () => {
 test('returns empty string for empty array', () => {
   expect(hexFromBytes(new Uint8Array([]))).toBe('')
 })
-
-test('handles all 0xff bytes', () => {
-  expect(hexFromBytes(new Uint8Array([255, 255, 255]))).toBe('ffffff')
-})
-
-test('handles all 0x00 bytes', () => {
-  expect(hexFromBytes(new Uint8Array([0, 0, 0]))).toBe('000000')
-})

@@ -1,37 +1,14 @@
-import { action, atom, bind, computed, context, wrap } from '@reatom/core'
-import { expect, test } from 'vitest'
+import { action, bind, context, wrap } from '@reatom/core'
+import { expect, test, vi } from 'vitest'
 
+import type { ReatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { resourceAttributesVar } from './resourceAttributesVar.ts'
-
-type WireValue =
-  | { stringValue: string }
-  | { bytesValue: string }
-  | { kvlistValue: { values: Array<{ key: string; value: WireValue }> } }
-type WireResource = { attributes: Array<{ key: string; value: WireValue }> }
-type WireSpan = {
-  name: string
-  traceId: string
-  spanId: string
-  parentSpanId?: string
-}
+import type { SpanContext } from './spanContext.ts'
+import { parsePayload, parseSpans } from './test-helpers.ts'
 
 const createRun = () =>
   context.start(() => bind(<T>(callback: () => T) => callback()))
-
-const wire = (bodies: readonly string[]) =>
-  bodies.flatMap((body) => {
-    const payload = JSON.parse(body) as {
-      resourceSpans?: Array<{
-        resource: WireResource
-        scopeSpans?: Array<{ spans?: WireSpan[] }>
-      }>
-    }
-    return (payload.resourceSpans ?? []).map((resource) => ({
-      resource: resource.resource,
-      spans: (resource.scopeSpans ?? []).flatMap((scope) => scope.spans ?? []),
-    }))
-  })
 
 const setup = (input: {
   filter: (name: string) => boolean
@@ -105,26 +82,13 @@ test.each(['sync', 'async'] as const)(
       expect(bodies.join('')).toContain('capture-resource-admission')
       expect(bodies.join('')).not.toContain('capture-resource-body')
       expect(bodies.join('')).not.toContain('capture-resource-completion')
-      const [exported] = wire(bodies)
+      const [exported] = parsePayload(bodies[0]!).resourceSpans
       expect(exported!.spans.map((span) => span.name)).toEqual([name])
       const attributes = exported!.resource.attributes
-      expect(
-        attributes.find((attribute) => attribute.key === 'tenant')?.value,
-      ).toEqual({
-        kvlistValue: {
-          values: [
-            {
-              key: 'phase',
-              value: { stringValue: 'capture-resource-admission' },
-            },
-          ],
-        },
+      expect(attributes.tenant).toEqual({
+        phase: 'capture-resource-admission',
       })
-      expect(
-        attributes.find((attribute) => attribute.key === 'bytes')?.value,
-      ).toEqual({
-        bytesValue: 'AQID',
-      })
+      expect(attributes.bytes).toEqual({ bytes: 'AQID' })
       expect(otel.stats()).toMatchObject({
         active: 0,
         queued: 0,
@@ -145,9 +109,11 @@ test('redacting params may dispose telemetry without changing the body/result or
   const run = createRun()
   const result = { result: 'capture-dispose-result' }
   const redacted: string[] = []
-  let otel: ReturnType<typeof reatomOpentelemetry> | undefined
+  const random = vi.spyOn(crypto, 'getRandomValues')
+  let idCallsAfterDispose = -1
+  let otel: ReatomOpentelemetry | undefined
   let bodyCalls = 0
-  let bodyContext: ReturnType<NonNullable<typeof otel>['getCurrentContext']>
+  let bodyContext: SpanContext | undefined
   let positive: ReturnType<typeof setup> | undefined
   try {
     otel = reatomOpentelemetry({
@@ -159,7 +125,10 @@ test('redacting params may dispose telemetry without changing the body/result or
       captureValues: {
         redact(key, value) {
           redacted.push(key)
-          if (key === 'params') otel!.dispose()
+          if (key === 'params') {
+            otel!.dispose()
+            idCallsAfterDispose = random.mock.calls.length
+          }
           return value
         },
       },
@@ -177,10 +146,20 @@ test('redacting params may dispose telemetry without changing the body/result or
     expect(run(target)).toBe(result)
     expect(bodyCalls).toBe(1)
     expect(redacted).toEqual(['params'])
+    // Disposal released admission before allocating any span or parent IDs.
+    expect(idCallsAfterDispose).toBe(0)
+    expect(random).not.toHaveBeenCalled()
     expect(bodyContext).toBeUndefined()
     expect(run(otel.getCurrentContext)).toBeUndefined()
     await otel.flush()
     expect(bodies).toEqual([])
+    expect(otel.stats()).toMatchObject({
+      active: 0,
+      queued: 0,
+      inFlight: 0,
+      dropped: 1,
+      droppedByReason: { disposed: 1, observation: 0 },
+    })
 
     positive = setup({
       filter: (name) => name === 'capture.dispose.positive',
@@ -192,61 +171,12 @@ test('redacting params may dispose telemetry without changing the body/result or
     expect(positive.run(next)).toEqual({ result: 'capture-dispose-positive' })
     await positive.otel.flush()
     expect(positive.bodies).toHaveLength(1)
-    expect(wire(positive.bodies)[0]!.spans.map((span) => span.name)).toEqual([
+    expect(parseSpans(positive.bodies[0]!).map((span) => span.name)).toEqual([
       'capture.dispose.positive',
     ])
   } finally {
     otel?.dispose()
     positive?.otel.dispose()
-  }
-})
-
-test('a telemetry-only atom read by redact does not become a dependency of the calling computed', async () => {
-  const telemetryOnly = atom(0, 'capture.isolation.telemetry')
-  const input = atom(1, 'capture.isolation.input')
-  const telemetryOnlyReads: number[] = []
-  const { otel, bodies, run } = setup({
-    filter: (name) => name === 'capture.isolation.action',
-    captureValues: {
-      redact(_key, value) {
-        telemetryOnlyReads.push(telemetryOnly())
-        return value
-      },
-    },
-  })
-  let consumerCalls = 0
-  let actionCalls = 0
-  try {
-    const work = action((value: number) => {
-      actionCalls++
-      return value
-    }, 'capture.isolation.action')
-    const consumer = computed(() => {
-      consumerCalls++
-      return work(input())
-    }, 'capture.isolation.consumer')
-
-    expect(run(consumer)).toBe(1)
-    expect(consumerCalls).toBe(1)
-    expect(actionCalls).toBe(1)
-    expect(telemetryOnlyReads.length).toBeGreaterThan(0)
-
-    expect(run(() => telemetryOnly.set(1))).toBe(1)
-    expect(run(consumer)).toBe(1)
-    expect(consumerCalls).toBe(1)
-    expect(actionCalls).toBe(1)
-
-    expect(run(() => input.set(2))).toBe(2)
-    expect(run(consumer)).toBe(2)
-    expect(consumerCalls).toBe(2)
-    expect(actionCalls).toBe(2)
-    await otel.flush()
-    expect(bodies).toHaveLength(1)
-    expect(wire(bodies)[0]!.spans.map((span) => span.name)).toEqual([
-      'capture.isolation.action',
-      'capture.isolation.action',
-    ])
-  } finally {
-    otel.dispose()
+    random.mockRestore()
   }
 })

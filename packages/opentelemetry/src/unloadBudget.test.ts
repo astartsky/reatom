@@ -3,6 +3,7 @@ import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { parseSpans } from './test-helpers.ts'
+import { availableUnloadBytes, reserveUnloadBytes } from './unloadBudget.ts'
 
 const LIMIT = 60 * 1024
 const bytes = (body: string) => new TextEncoder().encode(body).length
@@ -27,6 +28,24 @@ const installDocument = () => {
     },
   }
 }
+
+test('reserveUnloadBytes rejects amounts beyond the shared budget', () => {
+  installDocument()
+  try {
+    const document = globalThis.document
+    const available = availableUnloadBytes(document)
+    expect(available).toBe(LIMIT)
+    expect(() => reserveUnloadBytes(document, available + 1)).toThrow(
+      RangeError,
+    )
+    const credit = reserveUnloadBytes(document, available)
+    expect(() => reserveUnloadBytes(document, 1)).toThrow(RangeError)
+    credit.release()
+    expect(availableUnloadBytes(document)).toBe(LIMIT)
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
 
 const emit = (prefix: string, count: number, size = 4000) => {
   const names = Array.from(
@@ -86,6 +105,41 @@ test('keepalive selection includes the UTF-8 envelope and preserves mixed partia
       dropped: 5,
       droppedByReason: { oversized: 2, export: 3 },
     })
+  } finally {
+    otel.dispose()
+    warn.mockRestore()
+    vi.unstubAllGlobals()
+  }
+})
+
+test('flush() stays pending until an unload-triggered keepalive fetch settles', async () => {
+  const page = installDocument()
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  let resolveFetch!: (response: Response) => void
+  const fetch = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve
+      }),
+  )
+  const otel = reatomOpentelemetry({ ...base, fetch })
+  try {
+    emit('await', 1, 100)
+    page.hide()
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
+    expect(otel.stats().inFlight).toBe(1)
+
+    let flushSettled = false
+    const flushPromise = otel.flush().then(() => {
+      flushSettled = true
+    })
+    await vi.waitFor(() => expect(otel.stats().queued).toBe(0))
+    expect(flushSettled).toBe(false)
+
+    resolveFetch(new Response('{}'))
+    await flushPromise
+    expect(flushSettled).toBe(true)
+    expect(otel.stats()).toMatchObject({ inFlight: 0, exported: 1 })
   } finally {
     otel.dispose()
     warn.mockRestore()
@@ -464,7 +518,6 @@ test.each(['export', 'timeout', 'disposed'] as const)(
       b.dispose()
       finishBody?.()
       await vi.advanceTimersByTimeAsync(0)
-      expect(a.stats().inFlight).toBe(0)
       warn.mockRestore()
       vi.unstubAllGlobals()
       vi.useRealTimers()

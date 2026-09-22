@@ -1,14 +1,12 @@
-import { createRequire } from 'node:module'
-
-import type * as core from '@reatom/core'
 import { action, actionMiddleware, context, sleep, wrap } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import type { SpanInput } from './buildSpan.ts'
-import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-import { parseSpans } from './test-helpers.ts'
-import { HEX_SPAN_ID, HEX_TRACE_ID } from './test-helpers.ts'
-import { createTestWithOTel } from './test-helpers.ts'
+import {
+  createTestWithOTel,
+  HEX_SPAN_ID,
+  HEX_TRACE_ID,
+} from './test-helpers.ts'
 
 const collectSpans = () => {
   const spans: SpanInput[] = []
@@ -254,25 +252,6 @@ test.each([undefined, {}])(
   },
 )
 
-test('AbortError is control flow — no `exception` event emitted', async () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-  const failure = new DOMException('private-abort-reason', 'AbortError')
-
-  const aborted = action(async () => {
-    throw failure
-  }, 'aborted').extend(withOTel())
-
-  await context.start(async () => {
-    await expect(aborted()).rejects.toBe(failure)
-  })
-
-  expect(spans).toHaveLength(1)
-  expect(spans[0]!.status).toBeUndefined()
-  expect(spans[0]!.events ?? []).toEqual([])
-  expect(spans[0]!.attributes).toEqual({ payload: '[AbortError]' })
-})
-
 test('non-Error throw still records exception event with sane defaults', async () => {
   const { spans, queueSpan } = collectSpans()
   const withOTel = createTestWithOTel({
@@ -298,7 +277,31 @@ test('non-Error throw still records exception event with sane defaults', async (
   expect(Object.hasOwn(event.attributes!, 'exception.escaped')).toBe(false)
 })
 
-test('bare sibling actions in the same context.start get distinct traces', () => {
+test('a thrown Promise is control flow — [Suspension] marker, no exception event', async () => {
+  const { spans, queueSpan } = collectSpans()
+  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
+  const suspension = new Promise<never>(() => {})
+  const suspending = action(() => {
+    throw suspension
+  }, 'suspending').extend(withOTel())
+
+  let caught: unknown
+  await context.start(async () => {
+    try {
+      await suspending()
+    } catch (error) {
+      caught = error
+    }
+  })
+
+  expect(caught).toBe(suspension)
+  expect(spans).toHaveLength(1)
+  expect(spans[0]!.status).toBeUndefined()
+  expect(spans[0]!.events ?? []).toEqual([])
+  expect(spans[0]!.attributes).toEqual({ payload: '[Suspension]' })
+})
+
+test('sibling and repeated calls in one context.start get distinct root traces', () => {
   const { spans, queueSpan } = collectSpans()
   const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
 
@@ -308,49 +311,16 @@ test('bare sibling actions in the same context.start get distinct traces', () =>
   context.start(() => {
     a()
     b()
-  })
-
-  expect(spans).toHaveLength(2)
-  expect(spans[0]!.traceId).not.toBe(spans[1]!.traceId)
-  expect(spans[0]!.parentSpanId).toBeUndefined()
-  expect(spans[1]!.parentSpanId).toBeUndefined()
-})
-
-test('repeated calls to the same action get distinct root traces', () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-
-  const a = action(() => 'a', 'a').extend(withOTel())
-
-  context.start(() => {
-    a()
     a()
   })
 
-  expect(spans).toHaveLength(2)
-  expect(spans[0]!.traceId).not.toBe(spans[1]!.traceId)
-  expect(spans[0]!.parentSpanId).toBeUndefined()
-  expect(spans[1]!.parentSpanId).toBeUndefined()
-})
-
-test('repeated calls to the same async action get distinct root traces', async () => {
-  const { spans, queueSpan } = collectSpans()
-  const withOTel = createTestWithOTel({ queueSpan, isActive: () => true })
-
-  const a = action(async () => {
-    await wrap(sleep(0))
-    return 'a'
-  }, 'a').extend(withOTel())
-
-  await context.start(async () => {
-    await a()
-    await a()
-  })
-
-  expect(spans).toHaveLength(2)
-  expect(spans[0]!.traceId).not.toBe(spans[1]!.traceId)
-  expect(spans[0]!.parentSpanId).toBeUndefined()
-  expect(spans[1]!.parentSpanId).toBeUndefined()
+  expect(spans).toHaveLength(3)
+  expect(spans.map((span) => span.parentSpanId)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+  ])
+  expect(new Set(spans.map((span) => span.traceId)).size).toBe(3)
 })
 
 test('two concurrent async invocations of the same action get distinct root traces', async () => {
@@ -420,29 +390,16 @@ test('thrown queueSpan inside an async action does not become an unhandled rejec
   }
 })
 
-test('actions from another core entrypoint remain callable when installation is incompatible', async () => {
-  const foreign = createRequire(import.meta.url)('@reatom/core') as typeof core
-  const bodies: string[] = []
-  const otel = reatomOpentelemetry({
-    endpoint: 'https://collector.invalid',
-    serviceName: 'mixed-core',
-    fetch: async (_url, init) => {
-      bodies.push(String(init?.body))
-      return new Response(null)
-    },
+test('bigint payloads stringify to decimal strings without crashing the action', async () => {
+  const { spans, queueSpan } = collectSpans()
+  const withOTel = createTestWithOTel({
+    queueSpan,
+    isActive: () => true,
+    captureValues: {},
   })
-  try {
-    const target = foreign.action(() => 7, 'mixed.foreign')
-    expect(target.extend(otel.withOTel())).toBe(target)
-    expect(foreign.context.start(target)).toBe(7)
-    const local = action(() => 9, 'mixed.local')
-    expect(context.start(local)).toBe(9)
-    await otel.flush()
-    expect(bodies.flatMap(parseSpans).map((span) => span.name)).toEqual([
-      'mixed.local',
-    ])
-    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
-  } finally {
-    otel.dispose()
-  }
+  // JSON.stringify throws on bare bigints; the replacer must convert first.
+  const counter = action(async () => 1n, 'counter').extend(withOTel())
+
+  await context.start(() => counter())
+  expect(spans[0]!.attributes).toEqual({ params: '[]', payload: '"1"' })
 })

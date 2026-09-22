@@ -1,12 +1,12 @@
 import { getEventListeners } from 'node:events'
 
+import { mockRandom } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
-import { retryWithBackoff } from './retryWithBackoff.ts'
+import { ExportTimeoutError, retryWithBackoff } from './retryWithBackoff.ts'
 
 const OK = () => new Response(null, { status: 200 })
 const BAD_REQUEST = () => new Response(null, { status: 400 })
-const RATE_LIMITED = () => new Response(null, { status: 429 })
 const UNAVAILABLE = () => new Response(null, { status: 503 })
 
 const makeSleep = () => {
@@ -162,21 +162,10 @@ test('does not retry a non-network throw (e.g., plain Error)', async () => {
   expect(sleep).not.toHaveBeenCalled()
 })
 
-test('does not retry a non-network RangeError', async () => {
-  const send = vi.fn(async () => {
-    throw new RangeError('out of range')
-  })
-  const { sleep } = makeSleep()
-  await expect(
-    retryWithBackoff({ send, sleep, maxRetries: 5 }),
-  ).rejects.toThrow('out of range')
-  expect(send).toHaveBeenCalledTimes(1)
-})
-
-test('retries on 429', async () => {
+test.each([429, 502, 503, 504])('retries on %i', async (status: number) => {
   const send = vi
     .fn()
-    .mockResolvedValueOnce(RATE_LIMITED())
+    .mockResolvedValueOnce(new Response(null, { status }))
     .mockResolvedValueOnce(OK())
   const { sleep } = makeSleep()
   const response = await retryWithBackoff({ send, sleep })
@@ -192,6 +181,20 @@ test('throws synchronously if signal is already aborted, no send calls', async (
     retryWithBackoff({ send, signal: controller.signal }),
   ).rejects.toThrow()
   expect(send).not.toHaveBeenCalled()
+})
+
+test('defaults: three retries with exponential 1s-base delays', async () => {
+  const restoreRandom = mockRandom((_min, max) => max!)
+  try {
+    const send = vi.fn(async () => UNAVAILABLE())
+    const { sleep, calls } = makeSleep()
+    const response = await retryWithBackoff({ send, sleep })
+    expect(response.status).toBe(503)
+    expect(send).toHaveBeenCalledTimes(4)
+    expect(calls).toEqual([1000, 2000, 4000])
+  } finally {
+    restoreRandom()
+  }
 })
 
 test('aborting mid-sleep stops the retry loop without further sends', async () => {
@@ -247,4 +250,80 @@ test('does not retry an AbortError from send', async () => {
     }),
   ).rejects.toThrow()
   expect(send).toHaveBeenCalledTimes(1)
+})
+
+test('computed delays grow exponentially and honor maxDelayMs', async () => {
+  const restoreRandom = mockRandom((_min, max) => max!)
+  try {
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce(UNAVAILABLE())
+      .mockResolvedValueOnce(UNAVAILABLE())
+      .mockResolvedValueOnce(UNAVAILABLE())
+      .mockResolvedValueOnce(OK())
+    const { sleep, calls } = makeSleep()
+    const response = await retryWithBackoff({
+      send,
+      sleep,
+      baseDelayMs: 1000,
+      maxDelayMs: 1500,
+    })
+    expect(response.status).toBe(200)
+    expect(calls).toEqual([1000, 1500, 1500])
+  } finally {
+    restoreRandom()
+  }
+})
+
+test('a shared deadline stops the next attempt after an overshooting sleep', async () => {
+  const restoreRandom = mockRandom((_min, max) => max!)
+  try {
+    let now = 0
+    const send = vi.fn(async () => UNAVAILABLE())
+    // The transport sleeps longer than requested (a busy event loop does);
+    // the deadline must still gate the next attempt.
+    const sleep = vi.fn(async (ms: number) => {
+      now += ms * 10
+    })
+    await expect(
+      retryWithBackoff({
+        send,
+        sleep,
+        now: () => now,
+        deadline: 5000,
+        baseDelayMs: 1000,
+      }),
+    ).rejects.toThrow(ExportTimeoutError)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(sleep).toHaveBeenCalledTimes(1)
+  } finally {
+    restoreRandom()
+  }
+})
+
+test('an aborted signal discards a late successful response', async () => {
+  const controller = new AbortController()
+  const send = vi.fn(async () => {
+    controller.abort()
+    return OK()
+  })
+  const { sleep } = makeSleep()
+  await expect(
+    retryWithBackoff({ send, sleep, signal: controller.signal }),
+  ).rejects.toThrow()
+  expect(send).toHaveBeenCalledTimes(1)
+  expect(sleep).not.toHaveBeenCalled()
+})
+
+test('an already-expired deadline throws before any send', async () => {
+  const send = vi.fn(async () => OK())
+  await expect(
+    retryWithBackoff({
+      send,
+      sleep: makeSleep().sleep,
+      now: () => 10,
+      deadline: 5,
+    }),
+  ).rejects.toThrow(ExportTimeoutError)
+  expect(send).not.toHaveBeenCalled()
 })

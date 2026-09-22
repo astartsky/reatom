@@ -5,11 +5,20 @@ import { expect, test } from 'vitest'
 import { createValueCapture } from './captureValues.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
 import { toOtlpValue } from './toOtlpValue.ts'
-test('preserves int64 resources without converting unbounded bigints', () => {
+test('preserves int64 values without converting unbounded bigints', () => {
   const capture = createValueCapture()
   expect(toOtlpValue(capture.capture('id', 1234567890123456789n))).toEqual({
     intValue: '1234567890123456789',
   })
+  expect(capture.capture('max', 9223372036854775807n)).toBe(
+    9223372036854775807n,
+  )
+  expect(capture.capture('min', -9223372036854775808n)).toBe(
+    -9223372036854775808n,
+  )
+  expect(capture.capture('underflow', -9223372036854775809n)).toBe(
+    '[Unsafe bigint]',
+  )
   expect(toOtlpValue(capture.capture('large', 9999999999999999999n))).toEqual({
     stringValue: '[Unsafe bigint]',
   })
@@ -176,6 +185,12 @@ test('preserves own __proto__ content and ignores inherited and non-enumerable v
 
   expect(Object.getPrototypeOf(result)).toBe(null)
   expect(result).toEqual(JSON.parse('{"__proto__":{"public":"visible"}}'))
+  expect(
+    createValueCapture().capture(
+      'state',
+      Object.assign(Object.create(null), { public: 'visible' }),
+    ),
+  ).toEqual({ public: 'visible' })
 })
 
 test('never inspects objects beyond depth two', () => {
@@ -317,6 +332,12 @@ test('preserves boundary-length strings and never cuts a surrogate pair', () => 
   expect(createValueCapture().capture('payload', 'a'.repeat(2048))).toBe(
     'a'.repeat(2048),
   )
+  const overlong = createValueCapture().capture(
+    'payload',
+    'a'.repeat(2049),
+  ) as string
+  expect(overlong).toMatch(/\[Truncated\]$/)
+  expect(overlong.length).toBeLessThanOrEqual(2048)
   const result = createValueCapture().capture(
     'payload',
     '😀'.repeat(2048),
@@ -494,25 +515,53 @@ test('bounds sparse arrays and skips their accessors and inherited values', () =
   expect(result[0]).toBe('[Skipped]')
   expect(result[1]).toBe('[Undefined]')
   expect(result.at(-1)).toBe('[Truncated]')
+  const bogusLength = new Proxy([1, 2], {
+    getOwnPropertyDescriptor(target, key) {
+      return key === 'length'
+        ? {
+            value: 'not-a-length',
+            writable: true,
+            enumerable: false,
+            configurable: false,
+          }
+        : Reflect.getOwnPropertyDescriptor(target, key)
+    },
+  })
+  expect(createValueCapture().capture('params', bogusLength)).toBe('[Opaque]')
 })
 
-test('copies bytes without reading user length, constructor, iterator or slice properties', () => {
-  let calls = 0
-  const unexpected = () => {
-    calls++
-    throw new Error('user hook')
-  }
-  const input = new Uint8Array([1, 2, 3])
-  for (const key of ['length', 'constructor', 'slice', Symbol.iterator]) {
-    Object.defineProperty(input, key, { get: unexpected })
-  }
+test.each(['plain', 'subclass'] as const)(
+  'copies %s bytes without reading user length, constructor or hook properties',
+  (kind: 'plain' | 'subclass') => {
+    const input =
+      kind === 'subclass'
+        ? new (class extends Uint8Array {})([1, 2, 3])
+        : new Uint8Array([1, 2, 3])
+    let calls = 0
+    const unexpected = () => {
+      calls++
+      throw new Error('user byte hook')
+    }
+    for (const key of [
+      'length',
+      'constructor',
+      'slice',
+      'toJSON',
+      Symbol.iterator,
+      Symbol.toStringTag,
+    ]) {
+      Object.defineProperty(input, key, { get: unexpected })
+    }
 
-  const result = createValueCapture().capture('resource', input)
+    const result = createValueCapture().capture('bytes', input)
+    input[0] = 9
 
-  expect(calls).toBe(0)
-  expect(toOtlpValue(result)).toEqual({ bytesValue: 'AQID' })
-  expect(result === input).toBe(false)
-})
+    expect(calls).toBe(0)
+    expect(result === input).toBe(false)
+    expect(Object.getPrototypeOf(result)).toBe(Uint8Array.prototype)
+    expect(toOtlpValue(result)).toEqual({ bytesValue: 'AQID' })
+  },
+)
 
 test('fresh sessions and repeated captures never reuse mutable snapshots', () => {
   const input = { public: 'before' }
@@ -606,34 +655,6 @@ test('captures Buffer as privately owned ordinary bytes', () => {
   const result = createValueCapture().capture('bytes', input)
   input.fill(9)
 
-  expect(result === input).toBe(false)
-  expect(Object.getPrototypeOf(result)).toBe(Uint8Array.prototype)
-  expect(toOtlpValue(result)).toEqual({ bytesValue: 'AQID' })
-})
-
-test('copies Uint8Array subclasses without reading hostile user properties', () => {
-  class Bytes extends Uint8Array {}
-  const input = new Bytes([1, 2, 3])
-  let calls = 0
-  const unexpected = () => {
-    calls++
-    throw new Error('user byte hook')
-  }
-  for (const key of [
-    'length',
-    'constructor',
-    'slice',
-    'toJSON',
-    Symbol.iterator,
-    Symbol.toStringTag,
-  ]) {
-    Object.defineProperty(input, key, { get: unexpected })
-  }
-
-  const result = createValueCapture().capture('bytes', input)
-  input[0] = 9
-
-  expect(calls).toBe(0)
   expect(result === input).toBe(false)
   expect(Object.getPrototypeOf(result)).toBe(Uint8Array.prototype)
   expect(toOtlpValue(result)).toEqual({ bytesValue: 'AQID' })

@@ -1,6 +1,8 @@
-import { expect, test, vi } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 
 import { flushWithBeacon } from './flushWithBeacon.ts'
+
+afterEach(() => vi.unstubAllGlobals())
 
 test('posts the selected JSON unchanged as an application/json Blob', async () => {
   const body = JSON.stringify({ resourceSpans: [{ name: 'привет' }] })
@@ -51,6 +53,9 @@ test('skips transport for an empty selection', () => {
 })
 
 test('returns false when the browser API is unavailable', () => {
+  // Pin the environment shape instead of relying on the host Node build
+  // never shipping navigator.sendBeacon.
+  vi.stubGlobal('navigator', {})
   expect(
     flushWithBeacon({ endpoint: 'https://collector.example', body: '{}' }),
   ).toBe(false)

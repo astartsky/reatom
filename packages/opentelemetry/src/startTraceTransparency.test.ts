@@ -3,40 +3,6 @@ import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
 
-test('raw control: subscribed computed tracks its source through updates', () => {
-  const source = atom(1, 'raw.source')
-  const run = context.start(() => bind(<T>(callback: () => T) => callback()))
-  const values: number[] = []
-  const unsubscribe: Array<() => void> = []
-  try {
-    let bodyCalls = 0
-    const raw = computed(() => {
-      bodyCalls++
-      return source()
-    }, 'raw.control')
-    run(() => {
-      values.push(raw())
-      unsubscribe.push(raw.subscribe(() => values.push(raw())))
-    })
-    run(() => notify())
-    expect(values).toEqual([1, 1])
-    expect(bodyCalls).toBe(1)
-
-    run(() => {
-      source.set(2)
-      notify()
-      expect(raw()).toBe(2)
-      expect(bodyCalls).toBe(2)
-    })
-    expect(values.at(-1)).toBe(2)
-  } finally {
-    run(() => {
-      unsubscribe.forEach((d) => d())
-      notify()
-    })
-  }
-})
-
 test.each([false, true])(
   'startTrace preserves dependency tracking (disposed=%s)',
   (disposed: boolean) => {

@@ -25,54 +25,62 @@ const setup = (traced: boolean, captureValues?: false) => {
   return { run, otel, bodies, spans: () => bodies.flatMap(parseSpans) }
 }
 
-for (const kind of ['params', 'payload', 'async-payload'] as const) {
-  test.each([false, true])(
-    `default capture leaves ${kind} getters untouched (traced=%s)`,
-    async (traced: boolean) => {
-      const { run, otel, spans } = setup(traced)
-      let getterCalls = 0
-      let bodyCalls = 0
-      const value = {
-        get privateValue() {
-          getterCalls++
-          return 'getter-private-sentinel'
-        },
-      }
-      const input = kind === 'params' ? value : 7
-      const applicationPromise = Promise.resolve(value)
-      const output =
-        kind === 'params'
-          ? 7
-          : kind === 'async-payload'
-            ? applicationPromise
-            : value
-      try {
-        const invoke = run(() => {
-          const target = action((received: unknown) => {
-            bodyCalls++
-            expect(received).toBe(input)
-            return output
-          }, `capture-default.${kind}`)
-          return () => target(input)
-        })
-        const result = run(invoke)
-        expect(result).toBe(output)
-        if (kind === 'async-payload') {
-          expect(result).toBe(applicationPromise)
-          expect(await applicationPromise).toBe(value)
-        }
-        expect(bodyCalls).toBe(1)
-        await otel?.flush()
-        expect(spans().map((span) => span.name)).toEqual(
-          traced ? [`capture-default.${kind}`] : [],
-        )
-        expect(getterCalls).toBe(0)
-      } finally {
-        otel?.dispose()
-      }
+const expectGettersUntouched = async (
+  kind: 'params' | 'payload' | 'async-payload',
+  traced: boolean,
+) => {
+  const { run, otel, spans } = setup(traced)
+  let getterCalls = 0
+  let bodyCalls = 0
+  const value = {
+    get privateValue() {
+      getterCalls++
+      return 'getter-private-sentinel'
     },
-  )
+  }
+  const input = kind === 'params' ? value : 7
+  const applicationPromise = Promise.resolve(value)
+  const output =
+    kind === 'params'
+      ? 7
+      : kind === 'async-payload'
+        ? applicationPromise
+        : value
+  try {
+    const invoke = run(() => {
+      const target = action((received: unknown) => {
+        bodyCalls++
+        expect(received).toBe(input)
+        return output
+      }, `capture-default.${kind}`)
+      return () => target(input)
+    })
+    const result = run(invoke)
+    expect(result).toBe(output)
+    if (kind === 'async-payload') {
+      expect(result).toBe(applicationPromise)
+      expect(await applicationPromise).toBe(value)
+    }
+    expect(bodyCalls).toBe(1)
+    await otel?.flush()
+    expect(spans().map((span) => span.name)).toEqual(
+      traced ? [`capture-default.${kind}`] : [],
+    )
+    expect(getterCalls).toBe(0)
+  } finally {
+    otel?.dispose()
+  }
 }
+
+for (const kind of ['params', 'payload', 'async-payload'] as const) {
+  test(`default capture leaves ${kind} getters untouched`, () =>
+    expectGettersUntouched(kind, true))
+}
+
+// One untraced control: the traced variants carry the real contract that a
+// default adapter never evaluates application getters.
+test('without an adapter, application getters stay untouched', () =>
+  expectGettersUntouched('params', false))
 
 test('default span exports metadata without parameter or result values', async () => {
   const { run, otel, bodies, spans } = setup(true)

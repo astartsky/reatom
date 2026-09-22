@@ -1,4 +1,4 @@
-import { action, atom, bind, context } from '@reatom/core'
+import { action, atom, bind, computed, context } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
@@ -50,7 +50,7 @@ test('manual opt-in instruments a previously untouched filtered action exactly o
 
     // Manual opt-in applied TWICE to the SAME target.
     target.extend(otel.withOTel({ kind: 'client' }))
-    target.extend(otel.withOTel({ kind: 'client' }))
+    target.extend(otel.withOTel({ kind: 'producer' }))
 
     // Second ACTUAL execution: value/body preserved, exactly one span.
     let second = -1
@@ -64,8 +64,8 @@ test('manual opt-in instruments a previously untouched filtered action exactly o
     expect(spans()).toHaveLength(1)
     const span = spans()[0]!
     expect(span.name).toBe('mo.target')
-    // Wire kind is decoded by name in parseSpans ('client', not enum 2).
-    expect(span.kind).toBe('client')
+    // Wire kind is decoded by name in parseSpans; the later override wins.
+    expect(span.kind).toBe('producer')
     // Root context: the uninstrumented source chain leaves no parent.
     expect(span.parentSpanId).toBeUndefined()
 
@@ -81,6 +81,23 @@ test('manual opt-in instruments a previously untouched filtered action exactly o
     expect([child!.name, root!.name]).toEqual(['mo.target', 'manual-root'])
     expect(child!.parentSpanId).toBe(root!.spanId)
     expect(child!.traceId).toBe(root!.traceId)
+  } finally {
+    otel.dispose()
+  }
+})
+
+test('extending atoms and computeds with withOTel leaves them unchanged', async () => {
+  const { otel, spans, run } = setup()
+  try {
+    const source = atom(1, 'mo.atomTarget')
+    const derived = computed(() => source() + 1, 'mo.computedTarget')
+    expect(source.extend(otel.withOTel())).toBe(source)
+    expect(derived.extend(otel.withOTel())).toBe(derived)
+
+    run(() => source.set(2))
+    expect(run(derived)).toBe(3)
+    await otel.flush()
+    expect(spans()).toHaveLength(0)
   } finally {
     otel.dispose()
   }

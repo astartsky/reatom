@@ -341,6 +341,7 @@ test.each([false, true])(
     let entered: SpanContext | undefined
     let resumed: SpanContext | undefined
     let beforeRejection: unknown
+    let restored: SpanContext | undefined
     let allocatedOnRejection = -1
     let pending: Promise<void> | undefined
     try {
@@ -371,11 +372,13 @@ test.each([false, true])(
           ? otel.startTrace('rejected', () => carrier())
           : rejected()
         allocatedOnRejection = ids.mock.calls.length - before
+        restored = otel.getCurrentContext()
         return promise
       }, 'outer')
       pending = run(outer)
       expect(parentContext).toBeDefined()
       expect(entered).toBe(explicit ? undefined : parentContext)
+      expect(restored).toBe(parentContext)
       expect(beforeRejection).toMatchObject({ active: 1, queued: 3 })
       expect(allocatedOnRejection).toBe(0)
       expect(otel.stats()).toMatchObject({

@@ -23,12 +23,21 @@ test('returns undefined for unparseable values', () => {
   expect(parseRetryAfter('', 0)).toBeUndefined()
 })
 
-test('returns undefined for past HTTP-date so caller falls back to backoff', () => {
+test('returns undefined for non-integer seconds so callers keep jittered backoff', () => {
+  // '1e3' is neither a delta-seconds integer nor a parseable HTTP-date; a
+  // lenient numeric parse would honor it as exactly 1000ms and synchronize
+  // callers.
+  expect(parseRetryAfter('1e3', 0)).toBeUndefined()
+})
+test('returns undefined for past or same-second HTTP-date so caller falls back to backoff', () => {
   // A 0-delay retry against a server that already told us it's overloaded
-  // would just hammer it. Treat past dates as no-information.
+  // would just hammer it. Treat past dates as no-information; a date in the
+  // current second yields delta 0 — symmetric with the "0" delta-seconds.
   const now = Date.parse('2000-01-01T00:00:00Z')
   const past = 'Fri, 31 Dec 1999 23:59:59 GMT'
+  const sameSecond = 'Sat, 01 Jan 2000 00:00:00 GMT'
   expect(parseRetryAfter(past, now)).toBeUndefined()
+  expect(parseRetryAfter(sameSecond, now)).toBeUndefined()
 })
 
 test('returns undefined for "0" so caller falls back to jittered backoff', () => {

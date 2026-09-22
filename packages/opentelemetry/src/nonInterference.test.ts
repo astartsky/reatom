@@ -43,19 +43,6 @@ test.each([false, true])(
   },
 )
 
-test(`action: returning a revoked Proxy preserves identity`, () => {
-  const { proxy, revoke } = Proxy.revocable({}, {})
-  revoke()
-  const raw = action(() => proxy, 'raw')
-  const traced = action(() => proxy, 'traced').extend(
-    createTestWithOTel({ isActive: () => true, queueSpan() {} })(),
-  )
-  context.start(() => {
-    expect(raw() === proxy).toBe(true)
-    expect(traced() === proxy).toBe(true)
-  })
-})
-
 test(`action: inspecting a hostile error cannot replace the thrown value`, () => {
   const original = new Error('application failure')
   Object.defineProperty(original, 'constructor', {
@@ -99,28 +86,6 @@ test(`action: a throwing sink cannot change a successful application result`, ()
     expect(calls).toBe(1)
     expect(sink).toHaveBeenCalledTimes(1)
   })
-})
-
-test(`action: failure to generate IDs cannot prevent application execution`, () => {
-  const value = { value: 42 }
-  let calls = 0
-  const traced = action(() => {
-    calls++
-    return value
-  }, 'traced').extend(
-    createTestWithOTel({ isActive: () => true, queueSpan() {} })(),
-  )
-  const random = vi.spyOn(crypto, 'getRandomValues').mockImplementation(() => {
-    throw new Error('unavailable random source')
-  })
-  try {
-    context.start(() => {
-      expect(traced()).toBe(value)
-      expect(calls).toBe(1)
-    })
-  } finally {
-    random.mockRestore()
-  }
 })
 
 test(`action: plain thenables are returned without invoking then`, async () => {

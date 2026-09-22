@@ -180,6 +180,13 @@ test('mixed terminal outcomes are validated and counted exactly once', () => {
       droppedByReason: { export: 0.5 },
     }),
   ).toThrow(RangeError)
+  expect(() =>
+    lease.release({
+      exported: 0,
+      beaconAccepted: 0,
+      droppedByReason: { bogus: 10 },
+    }),
+  ).toThrow(RangeError)
   expect(queue.stats()).toEqual(before)
   lease.release({
     exported: 5,
@@ -247,7 +254,7 @@ test('synchronous worker and diagnostic failures do not escape or leak slots', a
   const onError = vi.fn(() => {
     throw new Error('logger failure')
   })
-  const { queue, push, send } = setup({
+  const { queue, push } = setup({
     send: () => {
       throw new Error('worker failure')
     },
@@ -262,6 +269,24 @@ test('synchronous worker and diagnostic failures do not escape or leak slots', a
     dropped: 1,
     droppedByReason: { export: 1 },
   })
-  expect(send).not.toHaveBeenCalled()
+  queue.dispose()
+})
+
+test('a completed flush clears its own wait deadline without a timeout count', async () => {
+  const onFlushTimeout = vi.fn()
+  const { queue, sent, push } = setup({
+    exportTimeoutMs: 30,
+    onFlushTimeout,
+  })
+  push(1)
+  const flush = queue.flush()
+  success(sent[0]!)
+  await flush
+
+  // The deadline timer must not survive the settled waiter: firing later
+  // would fabricate a flush_timeout diagnostic.
+  await vi.advanceTimersByTimeAsync(31)
+  expect(queue.stats().flushTimeouts).toBe(0)
+  expect(onFlushTimeout).not.toHaveBeenCalled()
   queue.dispose()
 })

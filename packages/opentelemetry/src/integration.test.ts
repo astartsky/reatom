@@ -9,7 +9,6 @@ import {
   beforeEach,
   expect,
   test,
-  vi,
 } from 'vitest'
 
 import type { OtlpSpan } from './buildSpan.ts'
@@ -21,7 +20,6 @@ import {
   findSpan,
   HEX_SPAN_ID,
   HEX_TRACE_ID,
-  installDomStubs,
   parsePayload,
   parseSpans,
   withWarnSpy,
@@ -238,24 +236,6 @@ test('custom headers and resourceAttributes reach the collector', async () => {
   expect(parsed.resourceSpans[0]!.scope.version).toBe('0.0.0-test')
 })
 
-test('filter excludes matching targets from auto-instrumentation', async () => {
-  const otel = start({
-    filter: (target) => !target.name.startsWith('integration.private.'),
-  })
-  const visible = action(() => 1, 'integration.public.visible')
-  const hidden = action(() => 2, 'integration.private.hidden')
-
-  context.start(() => {
-    visible()
-    hidden()
-  })
-  await otel.flush()
-
-  const names = collectedSpans().map((s) => s.name)
-  expect(names).toContain('integration.public.visible')
-  expect(names).not.toContain('integration.private.hidden')
-})
-
 test('persistent retryable failures retry and eventually succeed', async () => {
   let attempts = 0
   responder = () => {
@@ -283,97 +263,22 @@ test('persistent retryable failures retry and eventually succeed', async () => {
   expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
 })
 
-test('persistent HTTP failure surfaces as a console.warn and never escalates', async () => {
-  responder = () => ({ status: 400, body: 'nope' })
-  await withWarnSpy(async (warnSpy) => {
-    const otel = start({ retry: { maxRetries: 0 } })
-    const probe = action(() => 'x', 'integration.fail')
-    context.start(() => {
-      probe()
-    })
-
-    await otel.flush()
-
-    expect(received).toHaveLength(1)
-    expect(warnSpy).toHaveBeenCalled()
-    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('OTLP export')
-  })
-})
-
-test('partialSuccess on 2xx surfaces a warning with the rejected count', async () => {
-  // OTLP spec: collectors MAY return 200 with `partialSuccess.rejectedSpans`
-  // when only a subset of spans was accepted. Silently treating this as full
-  // success drops the operator signal; we surface it as a warn.
-  responder = () => ({
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      partialSuccess: {
-        rejectedSpans: 4,
-        errorMessage: 'attribute "user.id" exceeded 128B limit',
-      },
-    }),
-  })
-  await withWarnSpy(async (warnSpy) => {
-    const otel = start()
-    const probe = action(() => 'x', 'integration.partial')
-    context.start(() => {
-      for (let i = 0; i < 5; i++) probe()
-    })
-
-    await otel.flush()
-
-    const warnings = warnSpy.mock.calls.map((c) =>
-      c.map((a) => String(a)).join(' '),
-    )
-    const partial = warnings.find((w) => w.includes('partialSuccess'))
-    expect(partial).toBeDefined()
-    expect(partial!).toMatch(/4/)
-    expect(partial!).toContain('128B limit')
-  })
-})
-
-test('partialSuccess with rejectedSpans=0 reports the server warning without dropping', async () => {
-  // Spec: rejectedSpans=0 + non-empty errorMessage means "all accepted, but
-  // here is a server-side warning (e.g. deprecation). Preserve that diagnostic.
-  responder = () => ({
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      partialSuccess: { rejectedSpans: 0, errorMessage: 'soft warning' },
-    }),
-  })
-  await withWarnSpy(async (warnSpy) => {
-    const otel = start()
-    const probe = action(() => 'x', 'integration.partial-zero')
-    context.start(() => {
-      probe()
-    })
-
-    await otel.flush()
-
-    expect(warnSpy).toHaveBeenCalledTimes(1)
-    expect(String(warnSpy.mock.calls[0]![0])).toContain('soft warning')
-    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
-  })
-})
-
-test('persistent HTTP failure logs the count of dropped spans', async () => {
-  // Without the count, on-call reads "OTLP export … failed" with no signal
-  // of scale — was that 1 span lost or 100? Surface the dropped count so
-  // alerts can correlate failure pressure with traffic.
+test('persistent HTTP failure warns once with the reason and the dropped-span count', async () => {
   responder = () => ({ status: 400, body: 'nope' })
   await withWarnSpy(async (warnSpy) => {
     const otel = start({ retry: { maxRetries: 0 }, maxBatchSize: 100 })
-    const probe = action(() => 'x', 'integration.fail-count')
+    const probe = action(() => 'x', 'integration.fail')
     context.start(() => {
       for (let i = 0; i < 7; i++) probe()
     })
 
     await otel.flush()
 
-    const args = warnSpy.mock.calls[0]!
-    const joined = args.map((a) => String(a)).join(' ')
+    expect(received).toHaveLength(1)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    const joined = warnSpy.mock.calls[0]!.map((a) => String(a)).join(' ')
+    // Prefix and reason for triage, dropped count for scale correlation.
+    expect(joined).toContain('OTLP export')
     expect(joined).toMatch(/7/)
     expect(joined.toLowerCase()).toContain('span')
   })
@@ -389,99 +294,6 @@ test('flush() resolves only after the collector has received the batch', async (
   expect(received).toHaveLength(0)
   await otel.flush()
   expect(received).toHaveLength(1)
-})
-
-test('after dispose, subsequent atoms are not auto-instrumented', async () => {
-  // dispose is idempotent (removeItem/removeEventListener are no-ops on
-  // missing entries), so leaving the cleanup queued for afterEach is safe.
-  const otel = start()
-  otel.dispose()
-
-  const after = action(() => 1, 'integration.after-dispose')
-  context.start(() => {
-    after()
-  })
-
-  await otel.flush()
-  expect(received).toHaveLength(0)
-})
-
-test('a previously-instrumented action emits no spans after dispose', async () => {
-  const otel = start()
-  // Instrumented at creation time (auto-instrumentation is active).
-  const live = action(() => 'x', 'integration.live')
-
-  otel.dispose()
-
-  // The bound middleware on `live` still runs; it must short-circuit
-  // instead of pushing into the orphaned queue.
-  context.start(() => {
-    live()
-  })
-
-  await otel.flush()
-  expect(received).toHaveLength(0)
-})
-
-test('useBeacon: false unload-flush dispatches the fetch with keepalive: true', async () => {
-  const { windowListeners, restore } = installDomStubs()
-  try {
-    const fetchSpy = vi.fn<typeof globalThis.fetch>(
-      async (...args: Parameters<typeof globalThis.fetch>) =>
-        globalThis.fetch(...args),
-    )
-    start({ useBeacon: false, fetch: fetchSpy })
-
-    const probe = action(() => 'x', 'integration.unload-keepalive')
-    context.start(() => {
-      probe()
-    })
-
-    windowListeners.get('pagehide')!()
-    await new Promise<void>((r) => setTimeout(r, 0))
-
-    expect(fetchSpy).toHaveBeenCalled()
-    const init = fetchSpy.mock.calls[0]![1]!
-    expect(init.keepalive).toBe(true)
-  } finally {
-    restore()
-  }
-})
-
-test('flush() awaits the unload-triggered keepalive send', async () => {
-  const { windowListeners, restore } = installDomStubs()
-  try {
-    let resolveFetch: ((r: Response) => void) | undefined
-    const fetchSpy = vi.fn<typeof globalThis.fetch>(
-      () =>
-        new Promise<Response>((resolve) => {
-          resolveFetch = resolve
-        }),
-    )
-    const otel = start({ useBeacon: false, fetch: fetchSpy })
-
-    const probe = action(() => 'x', 'integration.unload-await')
-    context.start(() => {
-      probe()
-    })
-
-    windowListeners.get('pagehide')!()
-    await new Promise<void>((r) => setTimeout(r, 0))
-    expect(fetchSpy).toHaveBeenCalled()
-
-    let flushSettled = false
-    const flushPromise = otel.flush().then(() => {
-      flushSettled = true
-    })
-    await new Promise<void>((r) => setTimeout(r, 20))
-    expect(flushSettled).toBe(false)
-
-    resolveFetch!(new Response('{}', { status: 200 }))
-    await flushPromise
-    expect(flushSettled).toBe(true)
-  } finally {
-    restore()
-  }
 })
 
 test('resourceAttributesVar overrides merge into the emitted resource attributes', async () => {
@@ -599,6 +411,26 @@ test('spans with distinct resourceAttributesVar overrides land in separate resou
   )
 })
 
+test('structurally equal override snapshots merge into one resourceSpans entry', async () => {
+  const otel = start()
+  const first = action(() => undefined, 'integration.merge-first')
+  const second = action(() => undefined, 'integration.merge-second')
+
+  context.start(() => {
+    resourceAttributesVar.run({ 'deployment.environment': 'staging' }, first)
+    resourceAttributesVar.run({ 'deployment.environment': 'staging' }, second)
+  })
+  await otel.flush()
+
+  expect(received).toHaveLength(1)
+  const parsed = JSON.parse(received[0]!.body)
+  expect(parsed.resourceSpans).toHaveLength(1)
+  const names = parsed.resourceSpans[0].scopeSpans[0].spans.map(
+    (span: { name: string }) => span.name,
+  )
+  expect(names).toEqual(['integration.merge-first', 'integration.merge-second'])
+})
+
 test('resourceAttributesVar override does not bleed into the next batch', async () => {
   const otel = start({
     resourceAttributes: { 'deployment.environment': 'dev' },
@@ -677,7 +509,7 @@ test('drop-newest backpressure caps the queue at maxQueueSize', async () => {
   const burstSpans = collectedSpans().filter(
     (s) => s.name === 'integration.burst',
   )
-  expect(burstSpans.length).toBeLessThanOrEqual(5)
+  expect(burstSpans.length).toBe(5)
 })
 
 test('a failing nested action emits an error span and exception event without poisoning siblings', async () => {

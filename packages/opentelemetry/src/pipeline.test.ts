@@ -1,8 +1,9 @@
 import { action, context, EXTENSIONS } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
+import type { ReatomOpentelemetry } from './reatomOpentelemetry.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-import { installDomStubs } from './test-helpers.ts'
+import { installDomStubs, parseSpans } from './test-helpers.ts'
 
 test('capacity includes in-flight records and export is single-flight', async () => {
   const pending: Array<(response: Response) => void> = []
@@ -35,34 +36,25 @@ test('capacity includes in-flight records and export is single-flight', async ()
   }
 })
 
-test.each([
-  ['maxQueueSize', 0],
-  ['maxQueueSize', Number.NaN],
-  ['maxBatchSize', -1],
-  ['maxBatchSize', 1.5],
-  ['batchInterval', 0],
-  ['batchInterval', Infinity],
-  ['exportTimeoutMs', 0],
-  ['exportTimeoutMs', Infinity],
-] as const)(
-  'invalid %s=%s is rejected before installing instrumentation',
-  (key: string, value: number) => {
-    const before = [...EXTENSIONS]
-    let otel: ReturnType<typeof reatomOpentelemetry> | undefined
-    try {
-      expect(() => {
-        otel = reatomOpentelemetry({
-          endpoint: 'http://collector.invalid',
-          serviceName: 'test',
-          [key]: value,
-        })
-      }).toThrow(RangeError)
-      expect(EXTENSIONS).toEqual(before)
-    } finally {
-      otel?.dispose()
-    }
-  },
-)
+// The full validation matrix lives in queueOptions.test.ts; here one
+// representative case proves invalid options reject BEFORE the global
+// extension is installed.
+test('invalid queue options are rejected before installing instrumentation', () => {
+  const before = [...EXTENSIONS]
+  let otel: ReatomOpentelemetry | undefined
+  try {
+    expect(() => {
+      otel = reatomOpentelemetry({
+        endpoint: 'http://collector.invalid',
+        serviceName: 'test',
+        maxQueueSize: 0,
+      })
+    }).toThrow(RangeError)
+    expect(EXTENSIONS).toEqual(before)
+  } finally {
+    otel?.dispose()
+  }
+})
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void
@@ -451,35 +443,6 @@ test('failed observation releases its reservation and subsequent work still expo
   }
 })
 
-test('partial rejection has exact immutable terminal statistics', async () => {
-  const otel = reatomOpentelemetry({
-    ...base,
-    maxBatchSize: 10,
-    fetch: async () =>
-      new Response(JSON.stringify({ partialSuccess: { rejectedSpans: 3 } })),
-  })
-  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-  try {
-    const before = otel.stats()
-    emit(10)
-    await otel.flush()
-    expect(otel.stats()).toMatchObject({
-      active: 0,
-      queued: 0,
-      inFlight: 0,
-      exported: 7,
-      dropped: 3,
-      droppedByReason: { export: 3 },
-    })
-    expect(before.exported).toBe(0)
-    expect(before.droppedByReason.export).toBe(0)
-    expect(Object.isFrozen(otel.stats().droppedByReason)).toBe(true)
-  } finally {
-    otel.dispose()
-    warn.mockRestore()
-  }
-})
-
 test.each(['accepted', 'refused', 'throw'] as const)(
   'beacon %s accounts separately for excluded and selected records',
   async (outcome: string) => {
@@ -513,14 +476,8 @@ test.each(['accepted', 'refused', 'throw'] as const)(
       expect(fetch).not.toHaveBeenCalled()
       const blob = sendBeacon.mock.calls[0]![1] as Blob
       expect(blob.size).toBeLessThanOrEqual(60 * 1024)
-      const body = JSON.parse(await blob.text())
-      const spans = body.resourceSpans.flatMap(
-        (resource: { scopeSpans: { spans: { name: string }[] }[] }) =>
-          resource.scopeSpans.flatMap((scope) => scope.spans),
-      )
-      expect(spans.map((span: { name: string }) => span.name)).toEqual(
-        names.slice(1),
-      )
+      const spans = parseSpans(await blob.text())
+      expect(spans.map((span) => span.name)).toEqual(names.slice(1))
       expect(otel.stats()).toMatchObject({
         queued: 0,
         inFlight: 0,

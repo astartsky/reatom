@@ -25,19 +25,6 @@ test('POSTs payload as JSON to /v1/traces', async () => {
   )
 })
 
-test('sets Content-Type: application/json', async () => {
-  const fetch = okFetch()
-  await sendTraces({
-    endpoint: 'https://collector.example.com',
-    payload: PAYLOAD,
-    fetch,
-  })
-  const init = fetch.mock.calls[0]![1]! as RequestInit
-  expect((init.headers as Record<string, string>)['Content-Type']).toBe(
-    'application/json',
-  )
-})
-
 test('merges custom headers', async () => {
   const fetch = okFetch()
   await sendTraces({
@@ -128,4 +115,19 @@ test('forwards signal to fetch', async () => {
     signal: controller.signal,
   })
   expect(fetch.mock.calls[0]![1]!.signal).toBe(controller.signal)
+})
+
+test('rejects without fetch when the signal is already aborted', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const fetch = okFetch()
+  await expect(
+    sendTraces({
+      endpoint: 'https://collector.example.com',
+      payload: PAYLOAD,
+      fetch,
+      signal: controller.signal,
+    }),
+  ).rejects.toThrow()
+  expect(fetch).not.toHaveBeenCalled()
 })

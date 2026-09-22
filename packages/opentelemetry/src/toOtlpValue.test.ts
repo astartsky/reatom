@@ -92,6 +92,17 @@ test('drops nullish attribute keys, including in nested maps', () => {
   ])
 })
 
+test('preserves falsy-but-meaningful values; only nullish means absence', () => {
+  expect(
+    toOtlpAttributes({ empty: '', zero: 0, off: false, list: [] }),
+  ).toEqual([
+    { key: 'empty', value: { stringValue: '' } },
+    { key: 'zero', value: { intValue: '0' } },
+    { key: 'off', value: { boolValue: false } },
+    { key: 'list', value: { arrayValue: { values: [] } } },
+  ])
+})
+
 test('dispatches NaN and Infinity to doubleValue as strings', () => {
   expect(toOtlpValue(NaN)).toEqual({ doubleValue: 'NaN' })
   expect(toOtlpValue(Infinity)).toEqual({ doubleValue: 'Infinity' })

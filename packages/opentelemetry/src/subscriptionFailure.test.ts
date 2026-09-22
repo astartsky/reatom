@@ -2,12 +2,7 @@ import { action, context } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-
-interface WirePayload {
-  resourceSpans: Array<{
-    scopeSpans: Array<{ spans: Array<{ name: string }> }>
-  }>
-}
+import { parseSpans } from './test-helpers.ts'
 
 test('poisoned then cancelling its reservation must not capture on late settlement', async () => {
   const fetchMock = vi.fn<typeof globalThis.fetch>(
@@ -47,12 +42,9 @@ test('poisoned then cancelling its reservation must not capture on late settleme
     await otel.flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(otel.stats().exported).toBe(1)
-    const livePayload = JSON.parse(
-      String(fetchMock.mock.calls[0]![1]!.body),
-    ) as WirePayload
     expect(
-      livePayload.resourceSpans.flatMap((rs) =>
-        rs.scopeSpans.flatMap((ss) => ss.spans.map((s) => s.name)),
+      parseSpans(String(fetchMock.mock.calls[0]![1]!.body)).map(
+        (span) => span.name,
       ),
     ).toEqual(['liveCaptureControl'])
     fetchMock.mockClear()
@@ -132,11 +124,8 @@ test('poisoned then cancelling its reservation must not capture on late settleme
     })
     await otel.flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    const payload = JSON.parse(
-      String(fetchMock.mock.calls[0]![1]!.body),
-    ) as WirePayload
-    const names = payload.resourceSpans.flatMap((rs) =>
-      rs.scopeSpans.flatMap((ss) => ss.spans.map((s) => s.name)),
+    const names = parseSpans(String(fetchMock.mock.calls[0]![1]!.body)).map(
+      (span) => span.name,
     )
     expect(names).toEqual(['ordinaryAfterPoison'])
   } finally {

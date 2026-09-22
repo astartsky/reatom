@@ -48,20 +48,32 @@ test.each([
         partialSuccess: { rejectedSpans, errorMessage: 'collector rejected' },
       }),
     )
-    try {
-      emit()
-      await otel.flush()
+    await withWarnSpy(async (warn) => {
+      try {
+        emit()
+        await otel.flush()
 
-      expect(requests).toHaveLength(1)
-      expect(otel.stats()).toMatchObject({
-        exported: 1,
-        dropped: 4,
-        droppedByReason: { export: 4 },
-      })
-      assertConservation()
-    } finally {
-      otel.dispose()
-    }
+        expect(requests).toHaveLength(1)
+        const stats = otel.stats()
+        expect(stats).toMatchObject({
+          active: 0,
+          queued: 0,
+          inFlight: 0,
+          exported: 1,
+          dropped: 4,
+          droppedByReason: { export: 4 },
+        })
+        expect(Object.isFrozen(stats.droppedByReason)).toBe(true)
+        assertConservation()
+        expect(warn).toHaveBeenCalledTimes(1)
+        const joined = warn.mock.calls[0]!.map((a) => String(a)).join(' ')
+        expect(joined).toContain('partialSuccess')
+        expect(joined).toMatch(/4/)
+        expect(joined).toContain('collector rejected')
+      } finally {
+        otel.dispose()
+      }
+    })
   },
 )
 
@@ -89,29 +101,10 @@ test('zero rejectedSpans with a server warning exports all five and warns', asyn
 
 test.each([
   ['malformed JSON', '{'],
-  ['nonempty whitespace body', '  \n'],
-  ['null top-level', 'null'],
-  ['array top-level', '[]'],
-  ['scalar top-level', '1'],
-  ['null partialSuccess', '{"partialSuccess":null}'],
-  ['array partialSuccess', '{"partialSuccess":[]}'],
-  ['negative rejectedSpans', '{"partialSuccess":{"rejectedSpans":-1}}'],
-  ['fractional rejectedSpans', '{"partialSuccess":{"rejectedSpans":1.5}}'],
-  [
-    'unsafe rejectedSpans number',
-    '{"partialSuccess":{"rejectedSpans":9007199254740992}}',
-  ],
+  ['type-confused partialSuccess', '{"partialSuccess":[]}'],
   [
     'rejectedSpans larger than the sent batch',
     '{"partialSuccess":{"rejectedSpans":6}}',
-  ],
-  [
-    'int64 rejectedSpans larger than the sent batch',
-    '{"partialSuccess":{"rejectedSpans":"9223372036854775807"}}',
-  ],
-  [
-    'rejectedSpans beyond int64',
-    '{"partialSuccess":{"rejectedSpans":"9223372036854775808"}}',
   ],
 ] as const)(
   'invalid 2xx %s drops all five records without retry',

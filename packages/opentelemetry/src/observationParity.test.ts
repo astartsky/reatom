@@ -30,7 +30,7 @@ test.each(['size', 'timer', 'flush'] as const)(
           token: authorization,
           names: parseSpans(init?.body).map((span) => span.name),
         })
-        // Bound the broken exporter so the RED run terminates.
+        // Bound the report → export feedback loop.
         if (sent.length < 5) report()
         return new Response(null)
       }),

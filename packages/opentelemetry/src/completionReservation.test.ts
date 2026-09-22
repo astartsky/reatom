@@ -2,12 +2,7 @@ import { action, computed, context } from '@reatom/core'
 import { expect, test, vi } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-
-interface WirePayload {
-  resourceSpans: Array<{
-    scopeSpans: Array<{ spans: Array<{ name: string }> }>
-  }>
-}
+import { parseSpans } from './test-helpers.ts'
 
 const base = {
   endpoint: 'http://collector.invalid',
@@ -97,12 +92,7 @@ test('suspension and hostile-error observation free capacity; later work exports
     expect(failingCaptures).toBe(1)
     await otel.flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    const payload = JSON.parse(
-      String(fetchMock.mock.calls[0]![1]!.body),
-    ) as WirePayload
-    const spans = payload.resourceSpans.flatMap((rs) =>
-      rs.scopeSpans.flatMap((ss) => ss.spans),
-    )
+    const spans = parseSpans(String(fetchMock.mock.calls[0]![1]!.body))
     expect(spans.map((s) => s.name)).toEqual(['ordinary'])
     expect(otel.stats()).toMatchObject({
       active: 0,

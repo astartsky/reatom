@@ -2,13 +2,7 @@ import { action, atom, bind, context, wrap } from '@reatom/core'
 import { expect, test } from 'vitest'
 
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
-
-interface ParsedSpan {
-  traceId: string
-  spanId: string
-  parentSpanId?: string
-  name: string
-}
+import { type ParsedSpan, parseSpans } from './test-helpers.ts'
 
 const createRun = () =>
   context.start(() => bind(<T>(callback: () => T) => callback()))
@@ -28,18 +22,6 @@ const setup = (filter: (name: string) => boolean) => {
   })
   return { otel, bodies, run: createRun() }
 }
-
-const spansOf = (bodies: readonly string[]) =>
-  bodies.flatMap((body) => {
-    const payload = JSON.parse(body) as {
-      resourceSpans?: Array<{
-        scopeSpans?: Array<{ spans?: ParsedSpan[] }>
-      }>
-    }
-    return (payload.resourceSpans ?? []).flatMap((resource) =>
-      (resource.scopeSpans ?? []).flatMap((scope) => scope.spans ?? []),
-    )
-  })
 
 const span = (spans: readonly ParsedSpan[], name: string) => {
   const matches = spans.filter((candidate) => candidate.name === name)
@@ -111,7 +93,7 @@ test('reverse-overlapping same-action roots require explicit saved-context reent
 
     await otel.flush()
     expect(bodies).toHaveLength(1)
-    const spans = spansOf(bodies)
+    const spans = bodies.flatMap(parseSpans)
     expect(spans.map((item) => item.name).sort()).toEqual([
       'async.child.0',
       'async.child.1',
@@ -169,7 +151,7 @@ test('an explicit absent context under a root restores the caller and gives its 
 
     await otel.flush()
     expect(bodies).toHaveLength(1)
-    const spans = spansOf(bodies)
+    const spans = bodies.flatMap(parseSpans)
     expect(spans.map((item) => item.name).sort()).toEqual([
       'absence.child',
       'absence.outer',
@@ -217,7 +199,7 @@ test('withContext restores after a throw without replacing the application error
 
     await otel.flush()
     expect(bodies).toHaveLength(1)
-    const [root] = spansOf(bodies)
+    const [root] = bodies.flatMap(parseSpans)
     expect(root!.name).toBe('throw.root')
     expect(root!.parentSpanId).toBeUndefined()
   } finally {
@@ -273,7 +255,7 @@ test.each(['resolve', 'reject'] as const)(
       expect(run(later)).toBe(value)
       await otel.flush()
 
-      const spans = spansOf(bodies)
+      const spans = bodies.flatMap(parseSpans)
       expect(spans.map((item) => item.name).sort()).toEqual([
         'promise.child',
         'promise.independent',
@@ -327,7 +309,7 @@ test('withContext owns its pair without freezing or following the caller object'
     expect(otel.getCurrentContext()).toBeUndefined()
     await otel.flush()
 
-    const spans = spansOf(bodies)
+    const spans = bodies.flatMap(parseSpans)
     expect(spans.map((item) => item.name).sort()).toEqual([
       'owned.child',
       'owned.other',
@@ -336,67 +318,6 @@ test('withContext owns its pair without freezing or following the caller object'
     expectChild(span(spans, 'owned.child'), span(spans, 'owned.saved'))
   } finally {
     otel.dispose()
-  }
-})
-
-test('disposing a pending action prevents completion capture/export while its original Promise settles and a new factory exports', async () => {
-  const bodies: string[] = []
-  const run = createRun()
-  const gate = Promise.withResolvers<void>()
-  const payload = { pending: true }
-  const captures: string[] = []
-  let pending: Promise<typeof payload> | undefined
-  let first: ReturnType<typeof reatomOpentelemetry> | undefined
-  let second: ReturnType<typeof setup> | undefined
-  try {
-    first = reatomOpentelemetry({
-      endpoint: 'https://collector.invalid',
-      serviceName: 'no-core-spike',
-      retry: { maxRetries: 0 },
-      maxBatchSize: 100,
-      filter: (target) => target.name.startsWith('dispose.'),
-      captureValues: {
-        redact(key, value) {
-          captures.push(key)
-          return value
-        },
-      },
-      fetch: async (_url, init) => {
-        bodies.push(String(init?.body))
-        return new Response('{}', { status: 200 })
-      },
-    })
-    const pendingAction = action(() => {
-      const result = gate.promise.then(() => payload)
-      pending = result
-      return result
-    }, 'dispose.pending')
-    const returned = run(pendingAction)
-    expect(returned).toBe(pending)
-    expect(captures).toEqual(['params'])
-
-    first.dispose()
-    gate.resolve()
-    expect(await returned).toBe(payload)
-    await Promise.resolve()
-    expect(captures).toEqual(['params'])
-    await first.flush()
-    expect(bodies).toHaveLength(0)
-
-    second = setup((name) => name === 'dispose.second')
-    const later = action(() => ({ second: true }), 'dispose.second')
-    const laterResult = second.run(later)
-    expect(laterResult).toEqual({ second: true })
-    await second.otel.flush()
-    expect(second.bodies).toHaveLength(1)
-    expect(spansOf(second.bodies).map((item) => item.name)).toEqual([
-      'dispose.second',
-    ])
-  } finally {
-    gate.resolve()
-    await pending
-    first?.dispose()
-    second?.otel.dispose()
   }
 })
 
@@ -430,7 +351,7 @@ test('ordinary await wrap has no implicit adapter-context reentry', async () => 
 
     await otel.flush()
     expect(bodies).toHaveLength(1)
-    const spans = spansOf(bodies)
+    const spans = bodies.flatMap(parseSpans)
     expect(spans.map((item) => item.name).sort()).toEqual([
       'negative.child',
       'negative.parent',

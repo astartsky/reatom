@@ -130,3 +130,76 @@ test('a hostile rejection still releases its lease as an export failure', async 
     worker.dispose()
   }
 })
+
+test('a second send while the slot is occupied throws without stealing the lease', async () => {
+  let finish!: (outcome: BatchOutcome) => void
+  const worker = createExportWorker<number>({
+    exportTimeoutMs: 30,
+    send: () =>
+      new Promise<BatchOutcome>((resolve) => {
+        finish = resolve
+      }),
+  })
+  const first = { items: [1], release: vi.fn() }
+  const second = { items: [2], release: vi.fn() }
+  try {
+    worker.send(first as never)
+    expect(() => worker.send(second as never)).toThrow(
+      'OTLP transport slot is already occupied',
+    )
+    // Occupied is not quarantined: a healthy in-flight export reads false.
+    expect(worker.isQuarantined()).toBe(false)
+    finish(accepted(1))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(first.release).toHaveBeenCalledWith(accepted(1))
+    expect(second.release).not.toHaveBeenCalled()
+  } finally {
+    worker.dispose()
+  }
+})
+
+test('invalid excluded counts and outcomes surface as export failures', async () => {
+  const onError = vi.fn()
+  const worker = createExportWorker<number>({
+    exportTimeoutMs: 30,
+    onError,
+    send: async (items, state) => {
+      state.excludeOversized(items.length + 1)
+      return accepted(items.length)
+    },
+  })
+  const invalidCount = { items: [1], release: vi.fn() }
+  worker.send(invalidCount as never)
+  await vi.advanceTimersByTimeAsync(0)
+  expect(invalidCount.release).toHaveBeenCalledWith({
+    exported: 0,
+    beaconAccepted: 0,
+    droppedByReason: { export: 1 },
+  })
+  expect(onError).toHaveBeenCalledTimes(1)
+
+  // An outcome whose counts do not survive lease validation falls back to a
+  // plain export drop instead of wedging the slot.
+  const invalidOutcome = {
+    items: [1],
+    release: vi.fn().mockImplementationOnce(() => {
+      throw new RangeError('Invalid batch outcome')
+    }),
+  }
+  const next = createExportWorker<number>({
+    exportTimeoutMs: 30,
+    onError,
+    send: async () => ({ ...accepted(1), exported: 2 }),
+  })
+  next.send(invalidOutcome as never)
+  await vi.advanceTimersByTimeAsync(0)
+  expect(invalidOutcome.release).toHaveBeenCalledTimes(2)
+  expect(invalidOutcome.release).toHaveBeenLastCalledWith({
+    exported: 0,
+    beaconAccepted: 0,
+    droppedByReason: { export: 1 },
+  })
+  expect(onError).toHaveBeenCalledTimes(2)
+  worker.dispose()
+  next.dispose()
+})

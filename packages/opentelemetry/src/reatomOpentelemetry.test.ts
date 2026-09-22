@@ -1,3 +1,6 @@
+import { createRequire } from 'node:module'
+
+import type * as core from '@reatom/core'
 import { action, context } from '@reatom/core'
 import { afterEach, expect, test, vi } from 'vitest'
 
@@ -9,6 +12,7 @@ import {
   HEX_TRACE_ID,
   installDomStubs,
   parsePayload,
+  parseSpans,
 } from './test-helpers.ts'
 import type { OtlpAttrValue } from './toOtlpValue.ts'
 
@@ -99,6 +103,43 @@ test('filter excludes matching targets from auto-instrumentation', async () => {
   )
   expect(names).toContain('public.visible')
   expect(names).not.toContain('private.hidden')
+})
+
+test('a throwing filter is treated as ineligible and never breaks the application', async () => {
+  const { otel, fetchMock } = setup({
+    filter: () => {
+      throw new Error('filter bug')
+    },
+  })
+
+  const target = action(() => 'ok-result', 'filter-throw')
+  context.start(() => {
+    expect(target()).toBe('ok-result')
+  })
+
+  await otel.flush()
+  expect(fetchMock).not.toHaveBeenCalled()
+})
+
+test('invalid resourceAttributes drops each span as observation without leaking a slot', async () => {
+  const { otel, fetchMock } = setup({
+    resourceAttributes: [1, 2] as unknown as Record<string, never>,
+  })
+
+  const probe = action(() => 'x', 'probe')
+  context.start(() => {
+    expect(probe()).toBe('x')
+    expect(probe()).toBe('x')
+  })
+
+  await otel.flush()
+  expect(fetchMock).not.toHaveBeenCalled()
+  expect(otel.stats()).toMatchObject({
+    active: 0,
+    queued: 0,
+    dropped: 2,
+    droppedByReason: { observation: 2 },
+  })
 })
 
 test('actions created before reatomOpentelemetry are NOT auto-instrumented', async () => {
@@ -267,7 +308,48 @@ test('pagehide flushes even when document.visibilityState is "visible"', async (
     // `otel.flush()`. Let any in-flight send microtasks settle.
     await new Promise<void>((r) => setTimeout(r, 0))
     expect(fetchMock).toHaveBeenCalled()
-    expect(otel).toBeDefined()
+  } finally {
+    restore()
+  }
+})
+
+test('visibilitychange while still visible does not flush; the record stays queued', async () => {
+  const { documentListeners, restore } = installDomStubs()
+  try {
+    const { otel, fetchMock } = setup({ batchInterval: 100_000 })
+
+    const probe = action(() => 'x', 'probe')
+    context.start(() => {
+      probe()
+    })
+
+    const visibilityHandler = documentListeners.get('visibilitychange')
+    expect(visibilityHandler).toBeDefined()
+    visibilityHandler!()
+    await new Promise<void>((r) => setTimeout(r, 0))
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    // Only the ordinary flush path delivers the queued record.
+    await otel.flush()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  } finally {
+    restore()
+  }
+})
+
+test('dispose removes the document and window unload listeners', async () => {
+  const { documentListeners, windowListeners, restore } = installDomStubs()
+  try {
+    const { otel } = setup()
+    expect(documentListeners.get('visibilitychange')).toBeDefined()
+    expect(windowListeners.get('pagehide')).toBeDefined()
+
+    otel.dispose()
+
+    // A leaked listener keeps flushing into a disposed adapter forever —
+    // remounting adapters must not accumulate handlers.
+    expect(documentListeners.get('visibilitychange')).toBeUndefined()
+    expect(windowListeners.get('pagehide')).toBeUndefined()
   } finally {
     restore()
   }
@@ -330,7 +412,8 @@ test('dispose() cancels an in-flight retry sleep, no further fetch attempts', as
   otel.dispose()
   await flushPromise
 
-  // Wait beyond the next would-be retry window; nothing should fire.
+  // Settle window: the 30s retry sleep was cancelled by dispose, so nothing
+  // further may fire.
   await new Promise<void>((r) => setTimeout(r, 60))
   expect(fetchMock).toHaveBeenCalledTimes(1)
 })
@@ -528,7 +611,7 @@ test('bigint and Uint8Array resource attributes do not crash flush', async () =>
 // A self-referencing resource attribute must not hang the flush — OTel
 // mandates the tracer never escalate, and stable-key recursion with no
 // cycle guard would stack-overflow before the wire-payload's own guard runs.
-test('cyclic resourceAttributesVar value does not hang flush (stableKey cycle protection)', async () => {
+test('cyclic resourceAttributesVar value does not hang flush (cycle sanitized by value capture before stableKey grouping)', async () => {
   const { otel, fetchMock } = setup()
 
   // Override via resourceAttributesVar forces groupItemsByResource off its
@@ -544,4 +627,31 @@ test('cyclic resourceAttributesVar value does not hang flush (stableKey cycle pr
   await otel.flush()
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('actions from another core entrypoint remain callable when installation is incompatible', async () => {
+  const foreign = createRequire(import.meta.url)('@reatom/core') as typeof core
+  const bodies: string[] = []
+  const otel = reatomOpentelemetry({
+    endpoint: 'https://collector.invalid',
+    serviceName: 'mixed-core',
+    fetch: async (_url, init) => {
+      bodies.push(String(init?.body))
+      return new Response(null)
+    },
+  })
+  try {
+    const target = foreign.action(() => 7, 'mixed.foreign')
+    expect(target.extend(otel.withOTel())).toBe(target)
+    expect(foreign.context.start(target)).toBe(7)
+    const local = action(() => 9, 'mixed.local')
+    expect(context.start(local)).toBe(9)
+    await otel.flush()
+    expect(bodies.flatMap(parseSpans).map((span) => span.name)).toEqual([
+      'mixed.local',
+    ])
+    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 0 })
+  } finally {
+    otel.dispose()
+  }
 })

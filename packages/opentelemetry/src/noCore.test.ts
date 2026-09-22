@@ -9,19 +9,10 @@ import {
 } from '@reatom/core'
 import { expect, test } from 'vitest'
 
-import type { OtlpSpan } from './buildSpan.ts'
 import { reatomOpentelemetry } from './reatomOpentelemetry.ts'
+import { parseSpans } from './test-helpers.ts'
 
 const runInStore = () => context.start(() => bind(<T>(fn: () => T) => fn()))
-const wire = (bodies: string[]): OtlpSpan[] =>
-  bodies.flatMap((body) => {
-    const payload = JSON.parse(body) as {
-      resourceSpans: Array<{ scopeSpans: Array<{ spans: OtlpSpan[] }> }>
-    }
-    return payload.resourceSpans.flatMap((resource) =>
-      resource.scopeSpans.flatMap((scope) => scope.spans),
-    )
-  })
 const make = (
   options: Partial<Parameters<typeof reatomOpentelemetry>[0]> = {},
 ) => {
@@ -56,7 +47,7 @@ test('sync root/action nesting exports actual spans and preserves values and ide
     expect(calls).toBe(1)
     expect(otel.getCurrentContext()).toBeUndefined()
     await otel.flush()
-    const spans = wire(bodies)
+    const spans = bodies.flatMap(parseSpans)
     expect(spans.map((s) => s.name).sort()).toEqual(['child', 'parent', 'root'])
     const root = spans.find((s) => s.name === 'root')!
     const outer = spans.find((s) => s.name === 'parent')!
@@ -132,36 +123,9 @@ test('plain atoms stay lazy and reactive bodies/notifications match without trac
     expect(raw).toMatchObject(expected)
     expect(traced).toMatchObject(expected)
     await traced.fixture!.otel.flush()
-    expect(wire(traced.fixture!.bodies)).toEqual([])
+    expect(traced.fixture!.bodies.flatMap(parseSpans)).toEqual([])
   } finally {
     traced.fixture!.otel.dispose()
-  }
-})
-
-test('sync error identity is preserved and private messages stay absent by default', async () => {
-  const { otel, bodies } = make()
-  const run = runInStore()
-  const error = new Error('private-error-message')
-  const fail = action(() => {
-    throw error
-  }, 'failure')
-  try {
-    let caught: unknown
-    try {
-      run(fail)
-    } catch (value) {
-      caught = value
-    }
-    expect(caught).toBe(error)
-    expect(otel.getCurrentContext()).toBeUndefined()
-    await otel.flush()
-    const [span] = wire(bodies)
-    expect(span!.name).toBe('failure')
-    expect(span!.status?.code).toBe(2)
-    expect(span!.events[0]!.name).toBe('exception')
-    expect(bodies.join('')).not.toContain('private-error-message')
-  } finally {
-    otel.dispose()
   }
 })
 
@@ -174,7 +138,7 @@ test('opt-in capture, admission and subsequent export reuse the actual queue', a
     expect(run(() => send(value))).toBe(value)
     expect(run(() => send(value))).toBe(value)
     await otel.flush()
-    expect(wire(bodies)).toHaveLength(1)
+    expect(bodies.flatMap(parseSpans)).toHaveLength(1)
     expect(bodies.join('')).toContain('captured')
     expect(otel.stats()).toMatchObject({
       exported: 1,
@@ -185,7 +149,7 @@ test('opt-in capture, admission and subsequent export reuse the actual queue', a
     })
     expect(run(() => send(value))).toBe(value)
     await otel.flush()
-    expect(wire(bodies)).toHaveLength(2)
+    expect(bodies.flatMap(parseSpans)).toHaveLength(2)
     expect(otel.stats()).toMatchObject({ exported: 2, dropped: 1 })
   } finally {
     otel.dispose()
@@ -210,32 +174,6 @@ test('adapter never adds private observation or continuation metadata to origina
     expect(frameKeys).toEqual([])
     expect(contextKeys).toEqual([])
     await otel.flush()
-  } finally {
-    otel.dispose()
-  }
-})
-
-test('a rejected explicit root masks the outer context and restores it afterwards', async () => {
-  const { otel } = make({ maxQueueSize: 1 })
-  const run = runInStore()
-  let outer: ReturnType<typeof otel.getCurrentContext>
-  let inner: ReturnType<typeof otel.getCurrentContext>
-  let restored: ReturnType<typeof otel.getCurrentContext>
-  try {
-    run(() =>
-      otel.startTrace('outer', () => {
-        outer = otel.getCurrentContext()
-        otel.startTrace('rejected', () => {
-          inner = otel.getCurrentContext()
-        })
-        restored = otel.getCurrentContext()
-      }),
-    )
-    expect(outer).toBeDefined()
-    expect(inner).toBeUndefined()
-    expect(restored).toBe(outer!)
-    await otel.flush()
-    expect(otel.stats()).toMatchObject({ exported: 1, dropped: 1 })
   } finally {
     otel.dispose()
   }
